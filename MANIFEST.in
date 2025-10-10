@@ -1,0 +1,28 @@
+include README.md
+include LICENSE
+include CHANGELOG.md
+include CONTRIBUTING.md
+include requirements.txt
+include setup.py
+include Dockerfile
+include docker-compose.yml
+include .gitignore
+
+recursive-include models *.pkl
+recursive-include models *.joblib
+recursive-include models *.zip
+recursive-include config *.json
+recursive-include config *.yaml
+recursive-include config *.yml
+recursive-include docs *.md
+recursive-include docs *.rst
+recursive-include tests *.py
+recursive-include notebooks *.ipynb
+
+global-exclude *.pyc
+global-exclude __pycache__
+global-exclude .pytest_cache
+global-exclude .mypy_cache
+global-exclude *.egg-info
+global-exclude .DS_Store
+global-exclude Thumbs.db

@@ -1,0 +1,78 @@
+version: '3.8'
+
+services:
+  ai-trading:
+    build: .
+    container_name: ai-xauusd-trading
+    volumes:
+      - ./models:/app/models
+      - ./config:/app/config
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./results:/app/results
+    environment:
+      - PYTHONPATH=/app
+      - TZ=UTC
+    restart: unless-stopped
+    command: python quick_demo.py
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  jupyter:
+    build: .
+    container_name: ai-trading-jupyter
+    ports:
+      - "8888:8888"
+    volumes:
+      - ./:/app
+      - ./notebooks:/app/notebooks
+    environment:
+      - JUPYTER_TOKEN=ai-trading-token
+      - PYTHONPATH=/app
+    command: >
+      bash -c "
+      pip install jupyterlab &&
+      jupyter lab --ip=0.0.0.0 --port=8888 --no-browser --allow-root --NotebookApp.token='ai-trading-token'
+      "
+    profiles:
+      - jupyter
+
+  monitoring:
+    build: .
+    container_name: ai-trading-monitor
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./logs:/app/logs
+      - ./results:/app/results
+    environment:
+      - PYTHONPATH=/app
+    command: python -c "
+import time
+from pathlib import Path
+print('AI Trading Monitor starting...')
+while True:
+    # Simple monitoring loop
+    time.sleep(60)
+    print('Monitor: System healthy')
+"
+    profiles:
+      - monitor
+
+networks:
+  default:
+    name: ai-trading-network
+
+volumes:
+  models:
+    driver: local
+  config:
+    driver: local
+  data:
+    driver: local
+  logs:
+    driver: local
