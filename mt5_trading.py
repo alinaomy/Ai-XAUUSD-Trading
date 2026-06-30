@@ -3,29 +3,37 @@
 MT5 Ensemble Trader
 Combines the RL ensemble with a MetaTrader 5 connector.
 
+Credentials are loaded from .env (copy .env.example → .env and fill in values).
+CLI flags override .env values when provided.
+
 Usage:
   Paper backtest (CSV data, no MT5 needed):
     python mt5_trading.py --mode paper
 
   Live trading (Windows + MT5 terminal):
-    python mt5_trading.py --mode live --login 12345 --password mypass --server BrokerName-Live
+    python mt5_trading.py --mode live
 
 Options:
   --mode      paper | live          (default: paper)
   --csv       path to xauusd_data.csv
   --split     train/test split 0-1  (default: 0.8, paper only)
-  --balance   starting balance USD  (default: 1000, paper only)
+  --balance   starting balance USD  (default: MT5_BALANCE env or 1000)
   --ensemble  path to ensemble_models/ directory
-  --symbol    MT5 symbol name       (default: XAUUSD)
-  --risk      fraction of balance risked per trade (default: 0.02)
+  --symbol    MT5 symbol name       (default: MT5_SYMBOL env or XAUUSD)
+  --risk      fraction of balance risked per trade (default: MT5_RISK env or 0.02)
 """
 
 import argparse
 import json
 import logging
+import os
 import time
+
 import numpy as np
 import pandas as pd
+from dotenv import load_dotenv
+
+load_dotenv()  # reads .env from project root
 
 from mt5_connector import MT5Connector, add_indicators
 from ensemble_trader import EnsembleTrader
@@ -285,30 +293,46 @@ def main():
     parser.add_argument('--mode', choices=['paper', 'live'], default='paper')
     parser.add_argument('--csv', default='xauusd_data.csv')
     parser.add_argument('--split', type=float, default=0.8)
-    parser.add_argument('--balance', type=float, default=1000.0)
     parser.add_argument('--ensemble', default='./ensemble_models/')
-    parser.add_argument('--symbol', default='XAUUSD')
-    parser.add_argument('--risk', type=float, default=0.02)
-    # Live-only
-    parser.add_argument('--login', type=int, default=0)
-    parser.add_argument('--password', default='')
-    parser.add_argument('--server', default='')
+    # These default to env vars; CLI flags override when explicitly passed
+    parser.add_argument('--balance', type=float, default=None)
+    parser.add_argument('--symbol', default=None)
+    parser.add_argument('--risk', type=float, default=None)
+    parser.add_argument('--login', type=int, default=None)
+    parser.add_argument('--password', default=None)
+    parser.add_argument('--server', default=None)
     args = parser.parse_args()
+
+    # Resolve: CLI flag > .env variable > hard default
+    login    = args.login    or int(os.getenv('MT5_LOGIN', 0))
+    password = args.password or os.getenv('MT5_PASSWORD', '')
+    server   = args.server   or os.getenv('MT5_SERVER', '')
+    symbol   = args.symbol   or os.getenv('MT5_SYMBOL', 'XAUUSD')
+    balance  = args.balance  or float(os.getenv('MT5_BALANCE', 1000.0))
+    risk     = args.risk     or float(os.getenv('MT5_RISK', 0.02))
+
+    if args.mode == 'live':
+        missing = [k for k, v in [('MT5_LOGIN', login), ('MT5_PASSWORD', password), ('MT5_SERVER', server)] if not v]
+        if missing:
+            parser.error(
+                f"Live mode requires: {', '.join(missing)}\n"
+                "Set them in .env or pass as CLI flags (--login, --password, --server)."
+            )
 
     connector = MT5Connector(
         mode=args.mode,
         csv_path=args.csv,
-        initial_balance=args.balance,
-        login=args.login,
-        password=args.password,
-        server=args.server,
+        initial_balance=balance,
+        login=login,
+        password=password,
+        server=server,
     )
 
     trader = MT5EnsembleTrader(
         connector=connector,
         ensemble_path=args.ensemble,
-        symbol=args.symbol,
-        risk_pct=args.risk,
+        symbol=symbol,
+        risk_pct=risk,
     )
 
     if args.mode == 'paper':
