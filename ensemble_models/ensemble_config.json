@@ -1,0 +1,13 @@
+{
+  "models": ["ppo", "td3", "sac"],
+  "weights": {
+    "ppo": 1.0,
+    "td3": 1.0,
+    "sac": 1.0
+  },
+  "config": {
+    "ppo": {"algorithm": "PPO", "policy": "MlpPolicy", "timesteps": 10000},
+    "td3": {"algorithm": "TD3", "policy": "MlpPolicy", "timesteps": 10000},
+    "sac": {"algorithm": "SAC", "policy": "MlpPolicy", "timesteps": 10000}
+  }
+}

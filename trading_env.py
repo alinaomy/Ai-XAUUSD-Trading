@@ -1,7 +1,11 @@
-import gym
+try:
+    import gymnasium as gym
+    from gymnasium import spaces
+except ImportError:
+    import gym
+    from gym import spaces
 import numpy as np
 import pandas as pd
-from gym import spaces
 from market_regime_detector import MarketRegimeDetector, MarketRegime
 
 class TradingEnv(gym.Env):

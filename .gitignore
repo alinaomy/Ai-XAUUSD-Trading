@@ -152,6 +152,9 @@ data/
 *.xlsx
 *.xls
 
+# Allow model config files that must be committed
+!ensemble_models/ensemble_config.json
+
 # Logs
 logs/
 *.log
