@@ -211,7 +211,8 @@ def main():
         'style': 'scalp',
         'bars_trained': args.bars or 'all',
     }
-    config_path = os.path.join(SAVE_PATH, 'scalp_config.json')
+    # Save as ensemble_config.json so EnsembleTrader.load_ensemble() can find it
+    config_path = os.path.join(SAVE_PATH, 'ensemble_config.json')
     with open(config_path, 'w') as f:
         json.dump(config, f, indent=2)
     print(f"\nConfig saved → {config_path}")

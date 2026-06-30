@@ -1,0 +1,32 @@
+{
+  "models": [
+    "ppo",
+    "sac",
+    "td3"
+  ],
+  "weights": {
+    "ppo": 1.0,
+    "sac": 1.0,
+    "td3": 1.0
+  },
+  "config": {
+    "ppo": {
+      "algorithm": "PPO",
+      "policy": "MlpPolicy",
+      "timesteps": 500000
+    },
+    "sac": {
+      "algorithm": "SAC",
+      "policy": "MlpPolicy",
+      "timesteps": 500000
+    },
+    "td3": {
+      "algorithm": "TD3",
+      "policy": "MlpPolicy",
+      "timesteps": 500000
+    }
+  },
+  "timeframe": "M5",
+  "style": "scalp",
+  "bars_trained": 200000
+}
