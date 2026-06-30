@@ -1,0 +1,11 @@
+# Minimal requirements for MT5 trading on Windows
+# Install with: pip install -r requirements-mt5.txt
+
+MetaTrader5
+python-dotenv
+numpy
+pandas
+stable-baselines3
+torch
+gym
+scikit-learn
