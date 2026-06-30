@@ -63,7 +63,7 @@ class EnsembleTrader:
             model.learn(total_timesteps=config['timesteps'])
 
             # Save model
-            model_path = os.path.join(save_path, f'{model_name}_model.zip')
+            model_path = os.path.join(save_path, f'{model_name}_model')
             model.save(model_path)
 
             # Store model
@@ -92,7 +92,7 @@ class EnsembleTrader:
         self.model_weights = config['weights']
 
         for model_name in config['models']:
-            model_path = os.path.join(load_path, f'{model_name}_model.zip')
+            model_path = os.path.join(load_path, f'{model_name}_model')
 
             # Get algorithm class from config
             model_config = config['config'][model_name]
