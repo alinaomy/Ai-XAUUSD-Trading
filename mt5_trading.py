@@ -212,6 +212,10 @@ class MT5EnsembleTrader:
 
     # ── Core bar handler ─────────────────────────────────────────────────────
 
+    # Confidence thresholds to add 2nd and 3rd scalp position
+    SCALP_CONF_THRESHOLDS = [0.0, 0.60, 0.75]  # pos_count 0 → 1 → 2
+    MAX_SCALP_POSITIONS   = 3
+
     def on_bar(self, df: pd.DataFrame):
         min_bars = self.cfg['min_bars']
         if len(df) < min_bars:
@@ -231,27 +235,57 @@ class MT5EnsembleTrader:
 
         current_price = tick.ask
         positions     = self.connector.get_positions(self.symbol)
-        has_pos       = len(positions) > 0
+        n_pos         = len(positions)
 
         logger.info(
             f"[{self.style.upper()}] {self.connector.current_bar_date} | "
             f"price={current_price:.2f} action={action:+.3f} conf={confidence:.3f} "
-            f"pos={'YES' if has_pos else 'NO'}"
+            f"pos={n_pos}"
         )
 
-        if not has_pos:
-            self._try_entry(action, confidence, current_price)
-        else:
-            self._manage_position(positions[0], action)
+        # Manage all open positions — close any that get a signal flip
+        if positions:
+            self._manage_positions(positions, action)
+            # Re-fetch after potential closes
+            positions  = self.connector.get_positions(self.symbol)
+            n_pos      = len(positions)
 
-    def _try_entry(self, action: float, confidence: float, price: float):
+        # Entry: scalp allows up to 3 with increasing confluence, swing stays 1
+        max_pos = self.MAX_SCALP_POSITIONS if self.style == 'scalp' else 1
+        if n_pos < max_pos:
+            self._try_entry(action, confidence, current_price, n_pos, positions)
+
+    def _try_entry(self, action: float, confidence: float, price: float,
+                   pos_count: int = 0, existing: list = None):
+        existing = existing or []
+
+        # For 2nd and 3rd scalp trades require higher confidence
+        if self.style == 'scalp' and pos_count > 0:
+            required = self.SCALP_CONF_THRESHOLDS[min(pos_count, 2)]
+            if confidence < required:
+                logger.debug(
+                    f"[SCALP] Skip entry #{pos_count+1}: "
+                    f"conf={confidence:.3f} < {required:.2f} required"
+                )
+                return
+
+        # Direction consistency: don't mix longs and shorts
+        if existing:
+            existing_type = existing[0].type
+            if action > self.min_signal and existing_type != MT5Connector.ORDER_BUY:
+                return
+            if action < -self.min_signal and existing_type != MT5Connector.ORDER_SELL:
+                return
+
+        tag = f"#{pos_count+1}" if self.style == 'scalp' else ""
+
         if action > self.min_signal:
             volume = self._calc_volume(price)
             sl = round(price * (1 - self.stop_loss_pct), 2)
             tp = round(price * (1 + self.stop_loss_pct * self.tp_multiplier), 2)
             self.connector.place_order(
                 self.symbol, MT5Connector.ORDER_BUY, volume,
-                sl=sl, tp=tp, comment=f'{self.style}_buy'
+                sl=sl, tp=tp, comment=f'{self.style}_buy{tag}'
             )
         elif action < -self.min_signal:
             volume = self._calc_volume(price)
@@ -259,15 +293,20 @@ class MT5EnsembleTrader:
             tp = round(price * (1 - self.stop_loss_pct * self.tp_multiplier), 2)
             self.connector.place_order(
                 self.symbol, MT5Connector.ORDER_SELL, volume,
-                sl=sl, tp=tp, comment=f'{self.style}_sell'
+                sl=sl, tp=tp, comment=f'{self.style}_sell{tag}'
             )
 
+    def _manage_positions(self, positions: list, action: float):
+        """Close any position whose direction conflicts with current signal."""
+        for pos in positions:
+            is_long = pos.type == MT5Connector.ORDER_BUY
+            flip = (is_long and action < -self.min_signal) or \
+                   (not is_long and action > self.min_signal)
+            if flip:
+                self.connector.close_position(pos.ticket, comment='signal_flip')
+
     def _manage_position(self, pos, action: float):
-        is_long = pos.type == MT5Connector.ORDER_BUY
-        flip = (is_long and action < -self.min_signal) or \
-               (not is_long and action > self.min_signal)
-        if flip:
-            self.connector.close_position(pos.ticket, comment='signal_flip')
+        self._manage_positions([pos], action)
 
     # ── Paper backtest ───────────────────────────────────────────────────────
 
