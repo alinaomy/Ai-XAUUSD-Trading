@@ -128,6 +128,8 @@ class MT5EnsembleTrader:
 
         obs = self._build_obs(df)
         action, confidence = self.ensemble.predict_ensemble(obs)
+        action = float(np.squeeze(action))
+        confidence = float(np.squeeze(confidence))
 
         tick = self.connector.get_tick(self.symbol)
         if tick is None:
