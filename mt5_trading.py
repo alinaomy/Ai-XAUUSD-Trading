@@ -203,11 +203,24 @@ class MT5EnsembleTrader:
 
     # ── Position sizing ──────────────────────────────────────────────────────
 
-    def _calc_volume(self, price: float) -> float:
+    # Scalp risk scales down with each additional position to cap total exposure
+    SCALP_RISK_SCALE = [1.0, 0.75, 0.5]   # 1st=100%, 2nd=75%, 3rd=50% of risk_pct
+
+    def _calc_volume(self, price: float, pos_count: int = 0) -> float:
         account = self.connector.get_account_info()
-        risk_amount   = account.balance * self.risk_pct
+        risk_pct = self.risk_pct
+        if self.style == 'scalp':
+            # Cap base risk at 1% for scalp, then scale down per additional position
+            base_risk = min(self.risk_pct, 0.01)
+            scale     = self.SCALP_RISK_SCALE[min(pos_count, 2)]
+            risk_pct  = base_risk * scale
+        risk_amount   = account.balance * risk_pct
         risk_in_price = price * self.stop_loss_pct
         volume = risk_amount / (risk_in_price * 100)
+        logger.debug(
+            f"[SIZING] pos#{pos_count+1} risk={risk_pct*100:.2f}% "
+            f"→ ${risk_amount:.2f} risk → {volume:.2f} lots"
+        )
         return round(max(0.01, min(volume, 10.0)), 2)
 
     # ── Core bar handler ─────────────────────────────────────────────────────
@@ -289,7 +302,7 @@ class MT5EnsembleTrader:
         tag = f"#{pos_count+1}" if self.style == 'scalp' else ""
 
         if action > self.min_signal:
-            volume = self._calc_volume(price)
+            volume = self._calc_volume(price, pos_count)
             sl = round(price * (1 - self.stop_loss_pct), 2)
             tp = round(price * (1 + self.stop_loss_pct * self.tp_multiplier), 2)
             self.connector.place_order(
@@ -297,7 +310,7 @@ class MT5EnsembleTrader:
                 sl=sl, tp=tp, comment=f'{self.style}_buy{tag}'
             )
         elif action < -self.min_signal:
-            volume = self._calc_volume(price)
+            volume = self._calc_volume(price, pos_count)
             sl = round(price * (1 + self.stop_loss_pct), 2)
             tp = round(price * (1 - self.stop_loss_pct * self.tp_multiplier), 2)
             self.connector.place_order(
