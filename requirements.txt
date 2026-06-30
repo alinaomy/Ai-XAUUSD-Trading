@@ -12,7 +12,7 @@ requests==2.31.0
 
 # Technical Analysis
 ta==0.11.0
-pandas-ta==0.3.14b0
+# pandas-ta not used by any module in this project
 
 # Visualization
 matplotlib==3.8.2

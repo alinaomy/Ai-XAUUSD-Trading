@@ -1,26 +1,32 @@
 #!/usr/bin/env python3
 """
-MT5 Ensemble Trader
-Combines the RL ensemble with a MetaTrader 5 connector.
+MT5 Ensemble Trader — Swing (D1) + Scalp (M5)
 
 Credentials are loaded from .env (copy .env.example → .env and fill in values).
 CLI flags override .env values when provided.
 
 Usage:
-  Paper backtest (CSV data, no MT5 needed):
-    python mt5_trading.py --mode paper
+  Paper backtest — swing (D1):
+    python mt5_trading.py --mode paper --style swing
 
-  Live trading (Windows + MT5 terminal):
-    python mt5_trading.py --mode live
+  Paper backtest — scalp (M5):
+    python mt5_trading.py --mode paper --style scalp
+
+  Live trading — swing:
+    python mt5_trading.py --mode live --style swing
+
+  Live trading — scalp:
+    python mt5_trading.py --mode live --style scalp
 
 Options:
-  --mode      paper | live          (default: paper)
-  --csv       path to xauusd_data.csv
-  --split     train/test split 0-1  (default: 0.8, paper only)
-  --balance   starting balance USD  (default: MT5_BALANCE env or 1000)
-  --ensemble  path to ensemble_models/ directory
-  --symbol    MT5 symbol name       (default: MT5_SYMBOL env or XAUUSD)
-  --risk      fraction of balance risked per trade (default: MT5_RISK env or 0.02)
+  --mode      paper | live                       (default: paper)
+  --style     swing | scalp                      (default: swing)
+  --csv       CSV data file                      (default: auto by style)
+  --split     train/test split 0-1               (default: 0.8, paper only)
+  --balance   starting balance USD               (default: MT5_BALANCE env or 1000)
+  --ensemble  path to models directory           (default: auto by style)
+  --symbol    MT5 symbol name                    (default: MT5_SYMBOL env or XAUUSD)
+  --risk      fraction of balance per trade      (default: MT5_RISK env or 0.02)
 """
 
 import argparse
@@ -33,7 +39,7 @@ import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
 
-load_dotenv()  # reads .env from project root
+load_dotenv()
 
 from mt5_connector import MT5Connector, add_indicators
 from ensemble_trader import EnsembleTrader
@@ -49,86 +55,173 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-MIN_BARS = 30      # bars needed before trading begins
-LOOKBACK = 10      # price bars fed into ensemble observation
+# ── Style configs ─────────────────────────────────────────────────────────────
 
+STYLE_CONFIG = {
+    'swing': {
+        'csv':           'xauusd_data.csv',
+        'ensemble_path': './ensemble_models/',
+        'config_file':   'ensemble_config.json',
+        'min_bars':      30,
+        'lookback':      10,
+        'stop_loss_pct': 0.02,
+        'tp_multiplier': 4.0,
+        'min_signal':    0.20,
+        'mt5_timeframe': 'D1',
+        'live_interval': 3600,     # poll every hour (D1 bar)
+        'mt5_bars':      100,
+    },
+    'scalp': {
+        'csv':           'xauusd_m5_data.csv',
+        'ensemble_path': './scalp_models/',
+        'config_file':   'scalp_config.json',
+        'min_bars':      30,
+        'lookback':      20,
+        'stop_loss_pct': 0.0015,
+        'tp_multiplier': 3.0,
+        'min_signal':    0.15,
+        'mt5_timeframe': 'M5',
+        'live_interval': 300,      # poll every 5 minutes (M5 bar)
+        'mt5_bars':      100,
+    },
+}
+
+
+# ── Scalp observation builder ─────────────────────────────────────────────────
+
+def _build_scalp_obs(df: pd.DataFrame) -> np.ndarray:
+    """28-feature observation matching ScalpTradingEnv."""
+    lookback = 20
+    close = float(df['Close'].iloc[-1])
+    prices = (df['Close'].iloc[-lookback:].values.astype(float) / close) - 1.0
+
+    row = df.iloc[-1]
+    ema8  = float(row.get('ema8',  close))
+    ema21 = float(row.get('ema21', close))
+    indicators = np.array([
+        (ema8 - ema21) / (close + 1e-9),
+        float(row.get('rsi7',     50.0)) / 100.0,
+        float(row.get('atr14',    0.0))  / (close + 1e-9),
+        float(row.get('macd',     0.0))  / (close + 1e-9),
+        float(row.get('macd_sig', 0.0))  / (close + 1e-9),
+        float(row.get('stoch_k',  50.0)) / 100.0,
+        0.0,   # position placeholder
+        0.0,   # time-in-trade placeholder
+    ], dtype=np.float32)
+    return np.concatenate([prices.astype(np.float32), indicators]).reshape(1, -1)
+
+
+# ── Swing observation builder ─────────────────────────────────────────────────
+
+def _build_swing_obs(df: pd.DataFrame) -> np.ndarray:
+    """15-feature observation matching TradingEnv."""
+    lookback = 10
+    prices = df['Close'].iloc[-lookback:].values.astype(float)
+    row = df.iloc[-1]
+    rsi  = float(row.get('rsi',         50.0))
+    macd = float(row.get('macd',        0.0))
+    sig  = float(row.get('signal_line', 0.0))
+    return np.concatenate([prices, [rsi, macd, sig, 0.0, 1000.0]]).reshape(1, -1)
+
+
+# ── Scalp indicator calculator (for live M5 bars from MT5) ───────────────────
+
+def _add_scalp_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df['ema8']  = df['Close'].ewm(span=8,  adjust=False).mean()
+    df['ema21'] = df['Close'].ewm(span=21, adjust=False).mean()
+
+    delta = df['Close'].diff()
+    gain  = delta.where(delta > 0, 0).rolling(7).mean()
+    loss  = (-delta.where(delta < 0, 0)).rolling(7).mean()
+    df['rsi7'] = 100 - (100 / (1 + gain / loss))
+
+    hl  = df['High'] - df['Low']
+    hpc = (df['High'] - df['Close'].shift()).abs()
+    lpc = (df['Low']  - df['Close'].shift()).abs()
+    df['atr14'] = pd.concat([hl, hpc, lpc], axis=1).max(axis=1).rolling(14).mean()
+
+    ema12 = df['Close'].ewm(span=12, adjust=False).mean()
+    ema26 = df['Close'].ewm(span=26, adjust=False).mean()
+    df['macd']     = ema12 - ema26
+    df['macd_sig'] = df['macd'].ewm(span=9, adjust=False).mean()
+
+    low5  = df['Low'].rolling(5).min()
+    high5 = df['High'].rolling(5).max()
+    df['stoch_k'] = 100 * (df['Close'] - low5) / (high5 - low5 + 1e-9)
+
+    return df.fillna(0)
+
+
+# ── Main trader class ─────────────────────────────────────────────────────────
 
 class MT5EnsembleTrader:
     def __init__(
         self,
         connector: MT5Connector,
-        ensemble_path: str = './ensemble_models/',
+        style: str = 'swing',
+        ensemble_path: str = None,
         symbol: str = 'XAUUSD',
         risk_pct: float = 0.02,
-        stop_loss_pct: float = 0.02,
     ):
         self.connector = connector
-        self.symbol = symbol
-        self.risk_pct = risk_pct
-        self.stop_loss_pct = stop_loss_pct
+        self.style     = style
+        self.symbol    = symbol
+        self.risk_pct  = risk_pct
+        self.cfg       = STYLE_CONFIG[style]
 
-        logger.info(f"Loading ensemble from {ensemble_path} ...")
+        ep = ensemble_path or self.cfg['ensemble_path']
+        logger.info(f"[{style.upper()}] Loading ensemble from {ep} ...")
         self.ensemble = EnsembleTrader()
-        self.ensemble.load_ensemble(ensemble_path)
+        self.ensemble.load_ensemble(ep)
 
-        self.regime_detector = MarketRegimeDetector()
+        self.regime_detector  = MarketRegimeDetector()
+        self.stop_loss_pct    = self.cfg['stop_loss_pct']
+        self.tp_multiplier    = self.cfg['tp_multiplier']
+        self.min_signal       = self.cfg['min_signal']
+        self.trailing_stop_pct = self.stop_loss_pct  # updated by regime for swing
 
-        # Risk params — overwritten each bar by regime detector
-        self.trailing_stop_pct = 0.025
-        self.breakeven_trigger_pct = 0.015
-        self.min_signal = 0.20
-        self.tp_multiplier = 4.0   # TP = entry ± stop_loss_pct * tp_multiplier
-
-    # ── Observation ─────────────────────────────────────────────────────────
+    # ── Observation ──────────────────────────────────────────────────────────
 
     def _build_obs(self, df: pd.DataFrame) -> np.ndarray:
-        """Build the 15-feature vector matching TradingEnv observation space."""
-        prices = df['Close'].iloc[-LOOKBACK:].values.astype(float)
-        row = df.iloc[-1]
-        rsi = float(row.get('rsi', 50.0))
-        macd = float(row.get('macd', 0.0))
-        sig = float(row.get('signal_line', 0.0))
-        # position=0 and balance=1000 are placeholders (ensemble was trained this way)
-        return np.concatenate([prices, [rsi, macd, sig, 0.0, 1000.0]]).reshape(1, -1)
+        if self.style == 'scalp':
+            return _build_scalp_obs(df)
+        return _build_swing_obs(df)
 
-    # ── Regime ──────────────────────────────────────────────────────────────
+    # ── Regime (swing only) ──────────────────────────────────────────────────
 
     def _update_regime(self, df: pd.DataFrame):
+        if self.style != 'swing':
+            return
         try:
             regime, params = self.regime_detector.detect_regime(df, len(df) - 1)
             self.trailing_stop_pct = params['trailing_stop_pct']
-            self.breakeven_trigger_pct = params['breakeven_trigger']
-            self.min_signal = params['min_confidence_threshold']
-            logger.debug(
-                f"Regime={regime.value} trail={self.trailing_stop_pct:.3f} "
-                f"min_sig={self.min_signal:.2f}"
-            )
+            self.min_signal        = params['min_confidence_threshold']
+            logger.debug(f"Regime={regime.value}")
         except Exception as exc:
-            logger.warning(f"Regime detection skipped ({exc}), using defaults")
+            logger.debug(f"Regime skipped: {exc}")
 
     # ── Position sizing ──────────────────────────────────────────────────────
 
     def _calc_volume(self, price: float) -> float:
-        """Lots based on balance × risk_pct, floored at 0.01."""
         account = self.connector.get_account_info()
-        risk_amount = account.balance * self.risk_pct
-        # approx: 1 lot XAUUSD moves ~$1 per 0.01 price move; risk in price = price * stop_pct
+        risk_amount   = account.balance * self.risk_pct
         risk_in_price = price * self.stop_loss_pct
-        volume = risk_amount / (risk_in_price * 100)   # 100 oz per lot
+        volume = risk_amount / (risk_in_price * 100)
         return round(max(0.01, min(volume, 10.0)), 2)
 
     # ── Core bar handler ─────────────────────────────────────────────────────
 
     def on_bar(self, df: pd.DataFrame):
-        """Called on every new completed bar with all bars up to now."""
-        if len(df) < MIN_BARS:
+        min_bars = self.cfg['min_bars']
+        if len(df) < min_bars:
             return
 
         self._update_regime(df)
 
         obs = self._build_obs(df)
         action, confidence = self.ensemble.predict_ensemble(obs)
-        action = float(np.squeeze(action))
+        action     = float(np.squeeze(action))
         confidence = float(np.squeeze(confidence))
 
         tick = self.connector.get_tick(self.symbol)
@@ -137,11 +230,11 @@ class MT5EnsembleTrader:
             return
 
         current_price = tick.ask
-        positions = self.connector.get_positions(self.symbol)
-        has_pos = len(positions) > 0
+        positions     = self.connector.get_positions(self.symbol)
+        has_pos       = len(positions) > 0
 
         logger.info(
-            f"{self.connector.current_bar_date or 'live'} | "
+            f"[{self.style.upper()}] {self.connector.current_bar_date} | "
             f"price={current_price:.2f} action={action:+.3f} conf={confidence:.3f} "
             f"pos={'YES' if has_pos else 'NO'}"
         )
@@ -149,7 +242,7 @@ class MT5EnsembleTrader:
         if not has_pos:
             self._try_entry(action, confidence, current_price)
         else:
-            self._manage_position(positions[0], action, current_price)
+            self._manage_position(positions[0], action)
 
     def _try_entry(self, action: float, confidence: float, price: float):
         if action > self.min_signal:
@@ -158,20 +251,18 @@ class MT5EnsembleTrader:
             tp = round(price * (1 + self.stop_loss_pct * self.tp_multiplier), 2)
             self.connector.place_order(
                 self.symbol, MT5Connector.ORDER_BUY, volume,
-                sl=sl, tp=tp, comment=f'ens_buy_c{confidence:.2f}'
+                sl=sl, tp=tp, comment=f'{self.style}_buy'
             )
-
         elif action < -self.min_signal:
             volume = self._calc_volume(price)
             sl = round(price * (1 + self.stop_loss_pct), 2)
             tp = round(price * (1 - self.stop_loss_pct * self.tp_multiplier), 2)
             self.connector.place_order(
                 self.symbol, MT5Connector.ORDER_SELL, volume,
-                sl=sl, tp=tp, comment=f'ens_sell_c{confidence:.2f}'
+                sl=sl, tp=tp, comment=f'{self.style}_sell'
             )
 
-    def _manage_position(self, pos, action: float, price: float):
-        """Close on opposite signal."""
+    def _manage_position(self, pos, action: float):
         is_long = pos.type == MT5Connector.ORDER_BUY
         flip = (is_long and action < -self.min_signal) or \
                (not is_long and action > self.min_signal)
@@ -180,16 +271,18 @@ class MT5EnsembleTrader:
 
     # ── Paper backtest ───────────────────────────────────────────────────────
 
-    def run_paper_backtest(self, csv_path: str = 'xauusd_data.csv', split: float = 0.8) -> dict:
+    def run_paper_backtest(self, csv_path: str = None, split: float = 0.8) -> dict:
+        csv = csv_path or self.cfg['csv']
+        label = f"MT5 Paper Backtest [{self.style.upper()}]"
         logger.info("=" * 55)
-        logger.info("  MT5 Paper Backtest")
+        logger.info(f"  {label}")
         logger.info("=" * 55)
 
-        df = self.connector.load_csv(csv_path)
-        n = len(df)
+        df = self.connector.load_csv(csv)
+        n  = len(df)
         start = int(n * split)
 
-        logger.info(f"Total bars: {n} | Training: {start} | Test: {n - start}")
+        logger.info(f"Total bars: {n:,} | Test: {n-start:,}")
         logger.info(f"Test window: {df.index[start]} → {df.index[-1]}")
 
         self.connector.set_paper_data(df)
@@ -204,108 +297,138 @@ class MT5EnsembleTrader:
                 break
 
         self.connector.close_all_positions()
-        logger.info(f"Processed {bar_count} test bars")
+        logger.info(f"Processed {bar_count:,} test bars")
 
-        trades = self.connector.get_paper_trades()
+        trades  = self.connector.get_paper_trades()
         account = self.connector.get_account_info()
         results = self._summarize(trades, account)
-        self._print_results(results)
+        self._print_results(results, label)
 
-        trades.to_csv('mt5_paper_trades.csv', index=False)
-        with open('mt5_paper_results.json', 'w') as f:
+        out_prefix = f'mt5_{self.style}_paper'
+        trades.to_csv(f'{out_prefix}_trades.csv', index=False)
+        with open(f'{out_prefix}_results.json', 'w') as f:
             json.dump(results, f, indent=2, default=str)
-        logger.info("Saved: mt5_paper_trades.csv | mt5_paper_results.json")
+        logger.info(f"Saved: {out_prefix}_trades.csv | {out_prefix}_results.json")
 
         return results
 
     def _summarize(self, trades: pd.DataFrame, account) -> dict:
         init = self.connector._paper_initial_balance
         if trades.empty:
-            return {
-                'total_trades': 0,
-                'final_balance': round(account.balance, 2),
-                'initial_balance': init,
-                'return_pct': 0.0,
-            }
-
-        wins = trades[trades['pnl'] > 0]
+            return {'total_trades': 0, 'final_balance': round(account.balance, 2),
+                    'initial_balance': init, 'return_pct': 0.0}
+        wins   = trades[trades['pnl'] > 0]
         losses = trades[trades['pnl'] < 0]
-
         return {
-            'total_trades': len(trades),
-            'win_rate_pct': round(len(wins) / len(trades) * 100, 2),
-            'total_pnl': round(trades['pnl'].sum(), 2),
-            'avg_win': round(wins['pnl'].mean(), 2) if len(wins) else 0,
-            'avg_loss': round(losses['pnl'].mean(), 2) if len(losses) else 0,
-            'profit_factor': round(
+            'style':          self.style,
+            'total_trades':   len(trades),
+            'win_rate_pct':   round(len(wins) / len(trades) * 100, 2),
+            'total_pnl':      round(trades['pnl'].sum(), 2),
+            'avg_win':        round(wins['pnl'].mean(), 2) if len(wins) else 0,
+            'avg_loss':       round(losses['pnl'].mean(), 2) if len(losses) else 0,
+            'profit_factor':  round(
                 wins['pnl'].sum() / abs(losses['pnl'].sum()), 2
             ) if len(losses) and losses['pnl'].sum() != 0 else float('inf'),
             'initial_balance': round(init, 2),
-            'final_balance': round(account.balance, 2),
-            'return_pct': round((account.balance - init) / init * 100, 2),
+            'final_balance':   round(account.balance, 2),
+            'return_pct':      round((account.balance - init) / init * 100, 2),
         }
 
-    def _print_results(self, results: dict):
-        print("\n" + "=" * 50)
-        print("  MT5 Paper Backtest Results")
-        print("=" * 50)
+    def _print_results(self, results: dict, label: str = ''):
+        print("\n" + "=" * 55)
+        print(f"  {label or 'Results'}")
+        print("=" * 55)
         labels = {
-            'total_trades': 'Total Trades',
-            'win_rate_pct': 'Win Rate %',
-            'total_pnl': 'Total PnL $',
-            'avg_win': 'Avg Win $',
-            'avg_loss': 'Avg Loss $',
-            'profit_factor': 'Profit Factor',
-            'initial_balance': 'Initial Balance $',
-            'final_balance': 'Final Balance $',
-            'return_pct': 'Return %',
+            'total_trades':   'Total Trades',
+            'win_rate_pct':   'Win Rate %',
+            'total_pnl':      'Total PnL $',
+            'avg_win':        'Avg Win $',
+            'avg_loss':       'Avg Loss $',
+            'profit_factor':  'Profit Factor',
+            'initial_balance':'Initial Balance $',
+            'final_balance':  'Final Balance $',
+            'return_pct':     'Return %',
         }
-        for key, label in labels.items():
+        for key, lbl in labels.items():
             if key in results:
-                print(f"  {label:<22} {results[key]}")
-        print("=" * 50 + "\n")
+                print(f"  {lbl:<24} {results[key]}")
+        print("=" * 55 + "\n")
 
     # ── Live loop ────────────────────────────────────────────────────────────
 
-    def run_live(self, interval_seconds: int = 3600):
-        """Live trading loop — polls MT5 every `interval_seconds` (default 1 h for daily bars)."""
-        logger.info("Live MT5 trading started. Ctrl+C to stop.")
+    def run_live(self):
+        interval  = self.cfg['live_interval']
+        tf_label  = self.cfg['mt5_timeframe']
+        bar_count = self.cfg['mt5_bars']
+
+        logger.info(f"[{self.style.upper()}] Live trading started | "
+                    f"Timeframe={tf_label} | Poll every {interval}s | Ctrl+C to stop")
         try:
             while True:
-                df = self.connector.get_rates(self.symbol, count=100)
-                if df is not None and len(df) >= MIN_BARS:
+                df = self.connector.get_rates(self.symbol, count=bar_count)
+                if df is not None and len(df) >= self.cfg['min_bars']:
+                    # Add scalp indicators if needed (swing indicators added in get_rates)
+                    if self.style == 'scalp':
+                        df = _add_scalp_indicators(df)
                     self.on_bar(df)
                 else:
-                    logger.warning("Insufficient bars for decision")
-                time.sleep(interval_seconds)
+                    logger.warning("Insufficient bars — skipping")
+                time.sleep(interval)
         except KeyboardInterrupt:
-            logger.info("Stop signal received — closing all positions")
+            logger.info("Stop signal — closing all positions")
             self.connector.close_all_positions()
             self.connector.disconnect()
             logger.info("Shutdown complete")
 
 
-# ── Entry point ──────────────────────────────────────────────────────────────
+# ── MT5 get_rates for M5 ─────────────────────────────────────────────────────
+# Monkey-patch connector to support M5 timeframe in live mode
+
+_original_get_rates = MT5Connector.get_rates
+
+def _get_rates_with_tf(self, symbol='XAUUSD', count=100, timeframe='D1'):
+    if self.mode == 'paper':
+        return _original_get_rates(self, symbol, count)
+    tf_map = {
+        'D1': 'TIMEFRAME_D1',
+        'M5': 'TIMEFRAME_M5',
+        'M1': 'TIMEFRAME_M1',
+        'H1': 'TIMEFRAME_H1',
+    }
+    mt5_tf = getattr(self._mt5, tf_map.get(timeframe, 'TIMEFRAME_D1'))
+    rates = self._mt5.copy_rates_from_pos(symbol, mt5_tf, 0, count)
+    if rates is None:
+        return None
+    df = pd.DataFrame(rates)
+    df['time'] = pd.to_datetime(df['time'], unit='s')
+    df.set_index('time', inplace=True)
+    df.rename(columns={'open':'Open','high':'High','low':'Low',
+                        'close':'Close','tick_volume':'Volume'}, inplace=True)
+    return add_indicators(df)
+
+MT5Connector.get_rates = _get_rates_with_tf
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(
-        description='MT5 Ensemble Trader',
+        description='MT5 Ensemble Trader — Swing & Scalp',
         formatter_class=argparse.RawTextHelpFormatter,
     )
-    parser.add_argument('--mode', choices=['paper', 'live'], default='paper')
-    parser.add_argument('--csv', default='xauusd_data.csv')
-    parser.add_argument('--split', type=float, default=0.8)
-    parser.add_argument('--ensemble', default='./ensemble_models/')
-    # These default to env vars; CLI flags override when explicitly passed
-    parser.add_argument('--balance', type=float, default=None)
-    parser.add_argument('--symbol', default=None)
-    parser.add_argument('--risk', type=float, default=None)
-    parser.add_argument('--login', type=int, default=None)
+    parser.add_argument('--mode',  choices=['paper', 'live'], default='paper')
+    parser.add_argument('--style', choices=['swing', 'scalp'], default='swing')
+    parser.add_argument('--csv',      default=None, help='Override CSV data file')
+    parser.add_argument('--split',    type=float, default=0.8)
+    parser.add_argument('--ensemble', default=None, help='Override models directory')
+    parser.add_argument('--balance',  type=float, default=None)
+    parser.add_argument('--symbol',   default=None)
+    parser.add_argument('--risk',     type=float, default=None)
+    parser.add_argument('--login',    type=int, default=None)
     parser.add_argument('--password', default=None)
-    parser.add_argument('--server', default=None)
+    parser.add_argument('--server',   default=None)
     args = parser.parse_args()
 
-    # Resolve: CLI flag > .env variable > hard default
     login    = args.login    or int(os.getenv('MT5_LOGIN', 0))
     password = args.password or os.getenv('MT5_PASSWORD', '')
     server   = args.server   or os.getenv('MT5_SERVER', '')
@@ -313,32 +436,34 @@ def main():
     balance  = args.balance  or float(os.getenv('MT5_BALANCE', 1000.0))
     risk     = args.risk     or float(os.getenv('MT5_RISK', 0.02))
 
+    csv_path = args.csv or STYLE_CONFIG[args.style]['csv']
+
     if args.mode == 'live':
-        missing = [k for k, v in [('MT5_LOGIN', login), ('MT5_PASSWORD', password), ('MT5_SERVER', server)] if not v]
+        missing = [k for k, v in [('MT5_LOGIN', login), ('MT5_PASSWORD', password),
+                                   ('MT5_SERVER', server)] if not v]
         if missing:
             parser.error(
                 f"Live mode requires: {', '.join(missing)}\n"
-                "Set them in .env or pass as CLI flags (--login, --password, --server)."
+                "Set them in .env or pass as --login / --password / --server."
             )
 
     connector = MT5Connector(
         mode=args.mode,
-        csv_path=args.csv,
+        csv_path=csv_path,
         initial_balance=balance,
-        login=login,
-        password=password,
-        server=server,
+        login=login, password=password, server=server,
     )
 
     trader = MT5EnsembleTrader(
         connector=connector,
+        style=args.style,
         ensemble_path=args.ensemble,
         symbol=symbol,
         risk_pct=risk,
     )
 
     if args.mode == 'paper':
-        trader.run_paper_backtest(csv_path=args.csv, split=args.split)
+        trader.run_paper_backtest(csv_path=csv_path, split=args.split)
     else:
         trader.run_live()
 
