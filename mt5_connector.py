@@ -352,6 +352,8 @@ class MT5Connector:
 
     @property
     def current_bar_date(self) -> str:
-        if self._paper_data is None:
+        if self.mode == 'live':
+            return datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        if not hasattr(self, '_paper_data') or self._paper_data is None:
             return ''
         return str(self._paper_data.index[self._paper_idx])
