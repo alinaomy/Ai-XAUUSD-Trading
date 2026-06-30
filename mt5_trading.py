@@ -216,6 +216,11 @@ class MT5EnsembleTrader:
     SCALP_CONF_THRESHOLDS = [0.0, 0.60, 0.75]  # pos_count 0 → 1 → 2
     MAX_SCALP_POSITIONS   = 3
 
+    def _own_positions(self, positions: list) -> list:
+        """Filter to only positions opened by this bot instance (by comment prefix)."""
+        prefix = f'{self.style}_'
+        return [p for p in positions if p.comment.startswith(prefix)]
+
     def on_bar(self, df: pd.DataFrame):
         min_bars = self.cfg['min_bars']
         if len(df) < min_bars:
@@ -234,21 +239,25 @@ class MT5EnsembleTrader:
             return
 
         current_price = tick.ask
-        positions     = self.connector.get_positions(self.symbol)
+
+        # Only count/manage positions this bot opened (identified by comment prefix)
+        # This prevents interfering with manual trades or other strategies
+        all_positions = self.connector.get_positions(self.symbol)
+        positions     = self._own_positions(all_positions)
         n_pos         = len(positions)
 
         logger.info(
             f"[{self.style.upper()}] {self.connector.current_bar_date} | "
             f"price={current_price:.2f} action={action:+.3f} conf={confidence:.3f} "
-            f"pos={n_pos}"
+            f"pos={n_pos} (total_mt5={len(all_positions)})"
         )
 
-        # Manage all open positions — close any that get a signal flip
+        # Manage only bot-owned positions — close any that get a signal flip
         if positions:
             self._manage_positions(positions, action)
-            # Re-fetch after potential closes
-            positions  = self.connector.get_positions(self.symbol)
-            n_pos      = len(positions)
+            all_positions = self.connector.get_positions(self.symbol)
+            positions     = self._own_positions(all_positions)
+            n_pos         = len(positions)
 
         # Entry: scalp allows up to 3 with increasing confluence, swing stays 1
         max_pos = self.MAX_SCALP_POSITIONS if self.style == 'scalp' else 1
