@@ -427,6 +427,44 @@ class MT5EnsembleTrader:
         except Exception as exc:
             logger.debug(f"Regime skipped: {exc}")
 
+    # ── ATR spike / news bar detection ──────────────────────────────────────
+
+    # Mirrors ScalpTradingEnv._is_news_bar() — consistent between train and live
+    ATR_SPIKE_MULTIPLIER = 2.5
+    ATR_LOOKBACK         = 50   # bars of rolling average to compare against
+
+    def _is_atr_spike(self, df: pd.DataFrame) -> bool:
+        """Return True if the latest bar shows abnormal volatility (unscheduled news).
+
+        Two checks (either triggers the block):
+          1. Rolling ATR14 vs its 50-bar mean — mirrors training env _is_news_bar()
+          2. Current bar true range vs ATR14 mean — catches single-bar spikes faster
+        """
+        if 'atr14' not in df.columns or len(df) < self.ATR_LOOKBACK + 1:
+            return False
+
+        atr_mean = float(df['atr14'].iloc[-(self.ATR_LOOKBACK + 1):-1].mean())
+        if atr_mean == 0:
+            return False
+
+        # Check 1: rolling ATR elevated (same as training env)
+        atr_now = float(df['atr14'].iloc[-1])
+        if (atr_now / atr_mean) > self.ATR_SPIKE_MULTIPLIER:
+            return True
+
+        # Check 2: current bar's raw true range vs average ATR (faster single-bar detection)
+        last = df.iloc[-1]
+        prev_close = float(df['Close'].iloc[-2]) if len(df) >= 2 else float(last['Open'])
+        true_range = max(
+            float(last['High']) - float(last['Low']),
+            abs(float(last['High']) - prev_close),
+            abs(float(last['Low'])  - prev_close),
+        )
+        if (true_range / atr_mean) > self.ATR_SPIKE_MULTIPLIER:
+            return True
+
+        return False
+
     # ── MTF confluence gate ──────────────────────────────────────────────────
 
     def _mtf_confluence_ok(self, action: float, df: pd.DataFrame) -> bool:
@@ -563,10 +601,15 @@ class MT5EnsembleTrader:
             logger.debug(f"[SESSION] No new entries — {session_reason}")
             return
 
-        # News gate: block new entries during high-impact releases
+        # News gate layer 1: schedule-based (NFP, FOMC, CPI etc.)
         news_blocked, news_reason = self.news_filter.is_news_window()
         if news_blocked:
             logger.info(f"[NEWS] No new entries — {news_reason}")
+            return
+
+        # News gate layer 2: ATR spike detection — catches any unscheduled volatility event
+        if self._is_scalp and self._is_atr_spike(df):
+            logger.info(f"[NEWS] ATR spike detected — skipping entry (unscheduled volatility)")
             return
 
         # MTF confluence gate: only for hf_scalp (trained with MTF in obs).
