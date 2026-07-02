@@ -640,9 +640,8 @@ class MT5EnsembleTrader:
             logger.info(f"[NEWS] ATR spike detected — skipping entry (unscheduled volatility)")
             return
 
-        # MTF confluence gate: only for hf_scalp (trained with MTF in obs).
-        # scalp (M5) models were trained without MTF — gate would over-filter.
-        if self.style == 'hf_scalp' and not self._mtf_confluence_ok(action, df):
+        # MTF confluence gate: M30 trend aligned + M15 BOS/FVG required before entry.
+        if self._is_scalp and not self._mtf_confluence_ok(action, df):
             logger.debug(f"[MTF] No confluence — skip entry (action={action:+.3f})")
             return
 
