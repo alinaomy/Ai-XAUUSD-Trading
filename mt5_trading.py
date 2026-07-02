@@ -703,7 +703,7 @@ class MT5EnsembleTrader:
         # Session gate: block new entries outside active windows (position management above is unaffected)
         session_ok, session_reason = self.session_filter.is_allowed()
         if not session_ok:
-            logger.debug(f"[SESSION] No new entries — {session_reason}")
+            logger.info(f"[SESSION] No new entries — {session_reason}")
             return
 
         # News gate layer 1: schedule-based (NFP, FOMC, CPI etc.)
@@ -725,12 +725,12 @@ class MT5EnsembleTrader:
             if regime == 'trend':
                 # Trending: need M30+M15 confluence AND M5 breakout confirmation
                 if not self._mtf_confluence_ok(action, df):
-                    logger.debug(
+                    logger.info(
                         f"[MTF] TREND (ADX={adx:.1f}) — no HTF confluence, skip"
                     )
                     return
                 if not self._m5_breakout_ok(action, df):
-                    logger.debug(
+                    logger.info(
                         f"[M5] TREND (ADX={adx:.1f}) — no breakout confirmation, skip"
                     )
                     return
@@ -739,7 +739,7 @@ class MT5EnsembleTrader:
             else:
                 # Ranging: mean-reversion at boundaries, no MTF trend requirement
                 if not self._m5_range_entry_ok(action, df):
-                    logger.debug(
+                    logger.info(
                         f"[M5] RANGE (ADX={adx:.1f}) — not at boundary, skip"
                     )
                     return
