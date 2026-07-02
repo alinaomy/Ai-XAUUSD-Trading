@@ -126,7 +126,7 @@ STYLE_CONFIG = {
         'stop_loss_pct': 0.0015,    # 0.15% SL
         'rr_targets':    [0.5, 1.0, 2.0],
         'tp_fractions':  [1/3, 1/3, 1/3],
-        'min_signal':    0.15,
+        'min_signal':    0.67,      # require at least 2/3 models to agree
         'mt5_timeframe': 'M5',
         'live_interval': 300,       # poll every 5 min
         'mt5_bars':      100,
