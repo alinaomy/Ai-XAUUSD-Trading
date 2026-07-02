@@ -569,8 +569,9 @@ class MT5EnsembleTrader:
             logger.info(f"[NEWS] No new entries — {news_reason}")
             return
 
-        # MTF confluence gate: M30 trend must align with M15 BOS/FVG before entry
-        if not self._mtf_confluence_ok(action, df):
+        # MTF confluence gate: only for hf_scalp (trained with MTF in obs).
+        # scalp (M5) models were trained without MTF — gate would over-filter.
+        if self.style == 'hf_scalp' and not self._mtf_confluence_ok(action, df):
             logger.debug(f"[MTF] No confluence — skip entry (action={action:+.3f})")
             return
 

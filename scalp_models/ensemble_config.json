@@ -1,18 +1,18 @@
 {
-  "models": [
-    "td3"
-  ],
+  "models": ["ppo", "sac", "td3"],
   "weights": {
+    "ppo": 1.0,
+    "sac": 1.0,
     "td3": 1.0
   },
   "config": {
-    "td3": {
-      "algorithm": "TD3",
-      "policy": "MlpPolicy",
-      "timesteps": 5000000
-    }
+    "ppo": {"algorithm": "PPO", "policy": "MlpPolicy", "timesteps": 5000000},
+    "sac": {"algorithm": "SAC", "policy": "MlpPolicy", "timesteps": 5000000},
+    "td3": {"algorithm": "TD3", "policy": "MlpPolicy", "timesteps": 5000000}
   },
   "timeframe": "M5",
   "style": "scalp",
+  "use_mtf": false,
+  "obs_features": 28,
   "bars_trained": "all"
 }
