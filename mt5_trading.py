@@ -328,7 +328,8 @@ def _add_scalp_indicators(df: pd.DataFrame) -> pd.DataFrame:
     hl  = df['High'] - df['Low']
     hpc = (df['High'] - df['Close'].shift()).abs()
     lpc = (df['Low']  - df['Close'].shift()).abs()
-    df['atr14'] = pd.concat([hl, hpc, lpc], axis=1).max(axis=1).rolling(14).mean()
+    tr  = pd.concat([hl, hpc, lpc], axis=1).max(axis=1)
+    df['atr14'] = tr.rolling(14).mean()
 
     ema12 = df['Close'].ewm(span=12, adjust=False).mean()
     ema26 = df['Close'].ewm(span=26, adjust=False).mean()
@@ -338,6 +339,20 @@ def _add_scalp_indicators(df: pd.DataFrame) -> pd.DataFrame:
     low5  = df['Low'].rolling(5).min()
     high5 = df['High'].rolling(5).max()
     df['stoch_k'] = 100 * (df['Close'] - low5) / (high5 - low5 + 1e-9)
+
+    # ADX(14) — Wilder smoothing (alpha = 1/period), used for regime detection
+    up_move   = df['High'].diff()
+    down_move = -df['Low'].diff()
+    plus_dm   = np.where((up_move > down_move) & (up_move > 0),   up_move,   0.0)
+    minus_dm  = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+    alpha     = 1 / 14
+    atr_s     = tr.ewm(alpha=alpha, adjust=False).mean()
+    plus_di   = 100 * pd.Series(plus_dm,  index=df.index).ewm(alpha=alpha, adjust=False).mean() / (atr_s + 1e-9)
+    minus_di  = 100 * pd.Series(minus_dm, index=df.index).ewm(alpha=alpha, adjust=False).mean() / (atr_s + 1e-9)
+    dx        = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di + 1e-9)
+    df['adx']      = dx.ewm(alpha=alpha, adjust=False).mean()
+    df['plus_di']  = plus_di
+    df['minus_di'] = minus_di
 
     return df.fillna(0)
 
@@ -490,6 +505,68 @@ class MT5EnsembleTrader:
 
         return False
 
+    # ── M5 regime detection + entry filters ─────────────────────────────────
+
+    ADX_TREND_THRESHOLD = 22   # ADX >= 22 → trending; below → ranging
+
+    def _detect_m5_regime(self, df: pd.DataFrame) -> str:
+        """Return 'trend' or 'range' based on ADX of the M5 df."""
+        if 'adx' not in df.columns or len(df) < 20:
+            return 'trend'     # default to trend if ADX not yet available
+        adx = float(df['adx'].iloc[-1])
+        return 'trend' if adx >= self.ADX_TREND_THRESHOLD else 'range'
+
+    def _m5_breakout_ok(self, action: float, df: pd.DataFrame) -> bool:
+        """Trending regime: price must break the 10-bar high (long) or low (short).
+
+        Uses iloc[-11:-1] — excludes current bar so we're testing a real break,
+        not just that price is inside its own candle range.
+        """
+        if len(df) < 12:
+            return True
+        close    = float(df['Close'].iloc[-1])
+        high_10  = float(df['High'].iloc[-11:-1].max())
+        low_10   = float(df['Low'].iloc[-11:-1].min())
+        if action > 0:
+            ok = close > high_10
+        else:
+            ok = close < low_10
+        logger.debug(
+            f"[M5-BREAKOUT] {'LONG' if action > 0 else 'SHORT'} "
+            f"close={close:.2f} vs {'high' if action > 0 else 'low'}10="
+            f"{high_10 if action > 0 else low_10:.2f} → {'OK' if ok else 'SKIP'}"
+        )
+        return ok
+
+    def _m5_range_entry_ok(self, action: float, df: pd.DataFrame) -> bool:
+        """Ranging regime: mean-reversion entry at range boundaries with RSI confirmation.
+
+        Long  — price in bottom 25% of 20-bar range AND RSI7 < 38 (oversold)
+        Short — price in top    25% of 20-bar range AND RSI7 > 62 (overbought)
+        """
+        if len(df) < 22:
+            return False
+        close    = float(df['Close'].iloc[-1])
+        high_20  = float(df['High'].iloc[-20:].max())
+        low_20   = float(df['Low'].iloc[-20:].min())
+        rng      = high_20 - low_20
+        if rng < 1e-6:
+            return False
+
+        pos      = (close - low_20) / rng    # 0 = at low, 1 = at high
+        rsi      = float(df['rsi7'].iloc[-1]) if 'rsi7' in df.columns else 50.0
+        adx      = float(df['adx'].iloc[-1])  if 'adx'  in df.columns else 0.0
+
+        if action > 0:
+            ok = pos < 0.25 and rsi < 38
+        else:
+            ok = pos > 0.75 and rsi > 62
+        logger.info(
+            f"[M5-RANGE] {'LONG' if action > 0 else 'SHORT'} "
+            f"ADX={adx:.1f} pos_in_range={pos:.2f} RSI={rsi:.1f} → {'OK' if ok else 'SKIP'}"
+        )
+        return ok
+
     # ── MTF confluence gate ──────────────────────────────────────────────────
 
     def _mtf_confluence_ok(self, action: float, df: pd.DataFrame) -> bool:
@@ -640,10 +717,33 @@ class MT5EnsembleTrader:
             logger.info(f"[NEWS] ATR spike detected — skipping entry (unscheduled volatility)")
             return
 
-        # MTF confluence gate: M30 trend aligned + M15 BOS/FVG required before entry.
-        if self._is_scalp and not self._mtf_confluence_ok(action, df):
-            logger.debug(f"[MTF] No confluence — skip entry (action={action:+.3f})")
-            return
+        # Regime-aware entry filter (scalp only)
+        if self._is_scalp:
+            regime = self._detect_m5_regime(df)
+            adx    = float(df['adx'].iloc[-1]) if 'adx' in df.columns else 0.0
+
+            if regime == 'trend':
+                # Trending: need M30+M15 confluence AND M5 breakout confirmation
+                if not self._mtf_confluence_ok(action, df):
+                    logger.debug(
+                        f"[MTF] TREND (ADX={adx:.1f}) — no HTF confluence, skip"
+                    )
+                    return
+                if not self._m5_breakout_ok(action, df):
+                    logger.debug(
+                        f"[M5] TREND (ADX={adx:.1f}) — no breakout confirmation, skip"
+                    )
+                    return
+                logger.info(f"[M5] TREND entry (ADX={adx:.1f}) — breakout + MTF ok")
+
+            else:
+                # Ranging: mean-reversion at boundaries, no MTF trend requirement
+                if not self._m5_range_entry_ok(action, df):
+                    logger.debug(
+                        f"[M5] RANGE (ADX={adx:.1f}) — not at boundary, skip"
+                    )
+                    return
+                logger.info(f"[M5] RANGE entry (ADX={adx:.1f}) — boundary + RSI ok")
 
         # Entry: scalp allows up to 3 with increasing confluence, swing stays 1
         max_pos = self.MAX_SCALP_POSITIONS if self._is_scalp else 1
