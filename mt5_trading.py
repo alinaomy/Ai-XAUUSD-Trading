@@ -34,6 +34,7 @@ import json
 import logging
 import os
 import time
+from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
@@ -45,6 +46,50 @@ from mt5_connector import MT5Connector, add_indicators
 from ensemble_trader import EnsembleTrader
 from market_regime_detector import MarketRegimeDetector
 from news_filter import NewsFilter
+
+
+# ── Session filter ────────────────────────────────────────────────────────────
+
+class ScalpSessionFilter:
+    """
+    Block scalp ENTRIES outside active XAUUSD liquidity windows.
+    Existing positions are always managed — only new entries are blocked.
+
+    Gold liquidity windows (UTC):
+      07:00–09:00  London open      — directional energy, tight spreads
+      09:00–12:00  London session   — steady flow
+      12:00–13:00  Pre-NY buildup   — momentum pickup
+      13:00–17:00  London/NY overlap — highest volume, best for scalping
+      17:00–21:00  NY afternoon     — active until NY close
+
+    Blocked:  21:00–07:00 UTC (Asian session + overnight — thin, wide spreads)
+    """
+
+    # UTC hour ranges where new scalp entries are permitted [start, end)
+    ALLOWED_HOURS: list = [(7, 21)]   # 07:00–21:00 UTC covers all active sessions
+
+    def __init__(self, enabled: bool = True):
+        self.enabled = enabled
+
+    def is_allowed(self, now: datetime = None) -> tuple:
+        """Returns (allowed: bool, reason: str)."""
+        if not self.enabled:
+            return True, ''
+        now  = now or datetime.now(timezone.utc)
+        hour = now.hour
+        for start, end in self.ALLOWED_HOURS:
+            if start <= hour < end:
+                return True, ''
+        session = self._session_label(hour)
+        return False, f"Outside active session — {session} ({hour:02d}:{now.minute:02d} UTC)"
+
+    @staticmethod
+    def _session_label(hour: int) -> str:
+        if 0 <= hour < 7:
+            return "Asian session"
+        if 21 <= hour < 24:
+            return "NY close / overnight"
+        return "closed"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -69,38 +114,155 @@ STYLE_CONFIG = {
         'tp_multiplier': 4.0,
         'min_signal':    0.20,
         'mt5_timeframe': 'D1',
-        'live_interval': 3600,     # poll every hour (D1 bar)
+        'live_interval': 3600,
         'mt5_bars':      100,
     },
     'scalp': {
         'csv':           'xauusd_m5_data.csv',
         'ensemble_path': './scalp_models/',
-        'config_file':   'scalp_config.json',
+        'config_file':   'ensemble_config.json',
         'min_bars':      30,
         'lookback':      20,
-        'stop_loss_pct': 0.0015,
-        # 3 partial TPs at RR 0.5, 1.0, 2.0  (TP3 = 2.0 set as MT5 TP for safety)
+        'stop_loss_pct': 0.0015,    # 0.15% SL
         'rr_targets':    [0.5, 1.0, 2.0],
         'tp_fractions':  [1/3, 1/3, 1/3],
         'min_signal':    0.15,
         'mt5_timeframe': 'M5',
-        'live_interval': 300,      # poll every 5 minutes (M5 bar)
+        'live_interval': 300,       # poll every 5 min
+        'mt5_bars':      100,
+    },
+    # High-frequency scalp on M1 bars — tighter SL/TP, more signals per day
+    'hf_scalp': {
+        'csv':           'xauusd_m1_data.csv',
+        'ensemble_path': './hf_scalp_models/',
+        'config_file':   'ensemble_config.json',
+        'min_bars':      30,
+        'lookback':      20,
+        'stop_loss_pct': 0.0008,    # 0.08% SL (tighter for M1 micro-moves)
+        'rr_targets':    [0.5, 1.0, 2.0],
+        'tp_fractions':  [1/3, 1/3, 1/3],
+        'min_signal':    0.05,      # lower threshold → more entries per session
+        'mt5_timeframe': 'M1',
+        'live_interval': 60,        # poll every 1 min
         'mt5_bars':      100,
     },
 }
 
 
+# ── MTF indicator helpers ─────────────────────────────────────────────────────
+
+def _compute_htf_features(htf_df: pd.DataFrame) -> dict:
+    """Compute M15/M30 indicators from a fetched HTF OHLCV dataframe.
+    Returns dict with keys: ema_cross, rsi, trend, bos, fvg (latest bar values).
+    """
+    if htf_df is None or len(htf_df) < 10:
+        return {'ema_cross': 0.0, 'rsi': 0.5, 'trend': 0.0, 'bos': 0.0, 'fvg': 0.0}
+
+    close = htf_df['Close']
+    ema8  = close.ewm(span=8,  adjust=False).mean()
+    ema21 = close.ewm(span=21, adjust=False).mean()
+    delta = close.diff()
+    gain  = delta.where(delta > 0, 0).rolling(7).mean()
+    loss  = (-delta.where(delta < 0, 0)).rolling(7).mean()
+    rsi7  = 100 - (100 / (1 + gain / (loss + 1e-9)))
+    trend = np.sign(ema21.diff())
+
+    swing_high = htf_df['High'].shift(1).rolling(5).max()
+    swing_low  = htf_df['Low'].shift(1).rolling(5).min()
+    bos = np.where(close > swing_high, 1.0,
+          np.where(close < swing_low, -1.0, 0.0))
+    fvg = np.where(htf_df['Low']  > htf_df['High'].shift(2),  1.0,
+          np.where(htf_df['High'] < htf_df['Low'].shift(2),  -1.0, 0.0))
+
+    last_close = float(close.iloc[-1])
+    return {
+        'ema_cross': float((ema8.iloc[-1] - ema21.iloc[-1]) / (last_close + 1e-9)),
+        'rsi':       float(rsi7.iloc[-1]) / 100.0,
+        'trend':     float(trend.iloc[-1]),
+        'bos':       float(bos[-1]),
+        'fvg':       float(fvg[-1]),
+    }
+
+
+def _mtf_features_from_df_row(row) -> np.ndarray:
+    """Extract precomputed MTF columns from a df row (paper backtest mode)."""
+    return np.array([
+        float(row.get('m30_ema_cross', 0.0)),
+        float(row.get('m30_rsi',       0.5)),
+        float(row.get('m30_trend',     0.0)),
+        float(row.get('m15_ema_cross', 0.0)),
+        float(row.get('m15_rsi',       0.5)),
+        float(row.get('m15_bos',       0.0)),
+        float(row.get('m15_fvg',       0.0)),
+    ], dtype=np.float32)
+
+
+def _add_scalp_mtf_to_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Compute and forward-fill M15/M30 MTF columns into base-TF df.
+    Used for paper backtests so MTF obs are available without fetching from MT5.
+    """
+    df = df.copy()
+    if not isinstance(df.index, pd.DatetimeIndex):
+        # Try to parse from 'date' column
+        try:
+            df.index = pd.to_datetime(df.index)
+        except Exception:
+            return df   # can't resample — return as-is
+
+    def _resample_agg(rule: str) -> pd.DataFrame:
+        r = df[['Open', 'High', 'Low', 'Close', 'Volume']].resample(
+            rule, label='right', closed='right'
+        )
+        htf = r.agg({'Open': 'first', 'High': 'max', 'Low': 'min',
+                     'Close': 'last', 'Volume': 'sum'})
+        return htf.dropna(subset=['Close'])
+
+    def _indicators(htf: pd.DataFrame):
+        ema8  = htf['Close'].ewm(span=8,  adjust=False).mean()
+        ema21 = htf['Close'].ewm(span=21, adjust=False).mean()
+        delta = htf['Close'].diff()
+        gain  = delta.where(delta > 0, 0).rolling(7).mean()
+        loss  = (-delta.where(delta < 0, 0)).rolling(7).mean()
+        rsi7  = 100 - (100 / (1 + gain / (loss + 1e-9)))
+        trend = np.sign(ema21.diff())
+        swing_high = htf['High'].shift(1).rolling(5).max()
+        swing_low  = htf['Low'].shift(1).rolling(5).min()
+        bos = np.where(htf['Close'] > swing_high, 1.0,
+              np.where(htf['Close'] < swing_low, -1.0, 0.0))
+        fvg = np.where(htf['Low']  > htf['High'].shift(2),  1.0,
+              np.where(htf['High'] < htf['Low'].shift(2),  -1.0, 0.0))
+        return pd.DataFrame({
+            'ema_cross': (ema8 - ema21) / (htf['Close'] + 1e-9),
+            'rsi':       rsi7 / 100.0,
+            'trend':     trend,
+            'bos':       bos,
+            'fvg':       fvg,
+        }, index=htf.index)
+
+    m30 = _indicators(_resample_agg('30min'))
+    m15 = _indicators(_resample_agg('15min'))
+
+    df['m30_ema_cross'] = m30['ema_cross'].reindex(df.index, method='ffill')
+    df['m30_rsi']       = m30['rsi'].reindex(df.index, method='ffill')
+    df['m30_trend']     = m30['trend'].reindex(df.index, method='ffill')
+    df['m15_ema_cross'] = m15['ema_cross'].reindex(df.index, method='ffill')
+    df['m15_rsi']       = m15['rsi'].reindex(df.index, method='ffill')
+    df['m15_bos']       = m15['bos'].reindex(df.index, method='ffill')
+    df['m15_fvg']       = m15['fvg'].reindex(df.index, method='ffill')
+
+    return df.fillna(0)
+
+
 # ── Scalp observation builder ─────────────────────────────────────────────────
 
-def _build_scalp_obs(
-    df: pd.DataFrame,
-    signed_remaining: float = 0.0,
-    tp_progress: float = 0.0,
-) -> np.ndarray:
-    """28-feature observation matching ScalpTradingEnv.
+def _build_scalp_obs(df: pd.DataFrame, position_sign: float = 0.0,
+                     mtf_live: dict = None) -> np.ndarray:
+    """28-feature (base) or 35-feature (MTF) observation matching ScalpTradingEnv.
 
-    signed_remaining: +1.0=full long, -1.0=full short, ±0.67/±0.33 after partial TPs, 0=flat
-    tp_progress:      0.0 → 0.33 → 0.67 → 1.0 as each TP level is hit
+    position_sign: np.sign(position) — +1.0 long, -1.0 short, 0.0 flat.
+    mtf_live: dict from _compute_htf_features() for live M30 bars + M15 bars,
+              or None to read precomputed MTF columns from df (paper mode).
+    When mtf_live or MTF columns present → 35 features; otherwise 28.
     """
     lookback = 20
     close = float(df['Close'].iloc[-1])
@@ -116,10 +278,26 @@ def _build_scalp_obs(
         float(row.get('macd',     0.0))  / (close + 1e-9),
         float(row.get('macd_sig', 0.0))  / (close + 1e-9),
         float(row.get('stoch_k',  50.0)) / 100.0,
-        float(signed_remaining),   # direction + remaining fraction (matches env)
-        float(tp_progress),        # TP cascade progress (matches env)
+        float(position_sign),
+        0.0,    # time-in-trade unknown in live polling loop
     ], dtype=np.float32)
-    return np.concatenate([prices.astype(np.float32), indicators]).reshape(1, -1)
+
+    obs = np.concatenate([prices.astype(np.float32), indicators])
+
+    # MTF extension (7 features) — only for hf_scalp (35-feature models)
+    if mtf_live is not None:
+        # Live mode: use freshly fetched M30/M15 bars
+        m30, m15 = mtf_live
+        mtf = np.array([
+            m30['ema_cross'], m30['rsi'], m30['trend'],
+            m15['ema_cross'], m15['rsi'], m15['bos'], m15['fvg'],
+        ], dtype=np.float32)
+        obs = np.concatenate([obs, mtf])
+    elif 'm30_ema_cross' in row.index if hasattr(row, 'index') else 'm30_ema_cross' in row:
+        # Paper mode: MTF columns precomputed in df
+        obs = np.concatenate([obs, _mtf_features_from_df_row(row)])
+
+    return obs.reshape(1, -1)
 
 
 # ── Swing observation builder ─────────────────────────────────────────────────
@@ -198,43 +376,48 @@ class MT5EnsembleTrader:
         # ticket → {tp_prices, tp_hit, initial_vol, direction}
         self._scalp_tp_info: dict = {}
 
-        # News filter: skip entries during high-impact events (scalp only by default)
+        # News filter: skip entries during high-impact events (scalp styles only)
         self.news_filter = NewsFilter(
             pause_minutes_before=15,
             pause_minutes_after=30,
-            enabled=(style == 'scalp'),   # swing holds through news; scalp doesn't
+            enabled=self._is_scalp,
         )
+
+        # Session filter: only open scalp entries during active London/NY windows
+        self.session_filter = ScalpSessionFilter(enabled=self._is_scalp)
+
+        # MTF cache: (m30_features_dict, m15_features_dict) — refreshed each live bar
+        # Used for hf_scalp obs (35-feature) and confluence gate (both scalp styles)
+        self._mtf_live_cache: tuple = None   # None until first live bar
+
+    # ── Style helpers ────────────────────────────────────────────────────────
+
+    @property
+    def _is_scalp(self) -> bool:
+        """True for both 'scalp' (M5) and 'hf_scalp' (M1) styles."""
+        return self.style in ('scalp', 'hf_scalp')
 
     # ── Observation ──────────────────────────────────────────────────────────
 
     def _build_obs(self, df: pd.DataFrame, positions: list = None) -> np.ndarray:
-        if self.style == 'scalp':
-            signed_remaining, tp_progress = self._scalp_obs_state(positions or [])
-            return _build_scalp_obs(df, signed_remaining, tp_progress)
+        if self._is_scalp:
+            pos_sign = self._scalp_position_sign(positions or [])
+            # hf_scalp uses 35-feature obs (MTF extended); scalp uses 28-feature obs
+            mtf_live = self._mtf_live_cache if self.style == 'hf_scalp' else None
+            return _build_scalp_obs(df, pos_sign, mtf_live=mtf_live)
         return _build_swing_obs(df)
 
-    def _scalp_obs_state(self, positions: list) -> tuple:
-        """Compute signed_remaining and tp_progress from live position state."""
+    def _scalp_position_sign(self, positions: list) -> float:
+        """Return np.sign(position) equivalent for the live obs — matches training env."""
         if not positions:
-            return 0.0, 0.0
-
+            return 0.0
         pos = positions[0]
-        direction = 1 if pos.type == MT5Connector.ORDER_BUY else -1
-
-        info = self._scalp_tp_info.get(pos.ticket)
-        if info is None:
-            return float(direction), 0.0
-
-        tps_hit = sum(info['tp_hit'])
-        remaining_frac = 1.0 - tps_hit * (1/3)
-        signed_remaining = remaining_frac * direction
-        tp_progress = tps_hit / 3.0
-        return signed_remaining, tp_progress
+        return 1.0 if pos.type == MT5Connector.ORDER_BUY else -1.0
 
     # ── Regime (swing only) ──────────────────────────────────────────────────
 
     def _update_regime(self, df: pd.DataFrame):
-        if self.style != 'swing':
+        if self._is_scalp:
             return
         try:
             regime, params = self.regime_detector.detect_regime(df, len(df) - 1)
@@ -243,6 +426,55 @@ class MT5EnsembleTrader:
             logger.debug(f"Regime={regime.value}")
         except Exception as exc:
             logger.debug(f"Regime skipped: {exc}")
+
+    # ── MTF confluence gate ──────────────────────────────────────────────────
+
+    def _mtf_confluence_ok(self, action: float, df: pd.DataFrame) -> bool:
+        """Check M30 trend bias + M15 BOS/FVG before any scalp entry.
+
+        Logic:
+          Long signal  (action > 0): M30 trend bullish (ema8 > ema21) AND
+                                     M15 shows bullish BOS or bullish FVG.
+          Short signal (action < 0): M30 trend bearish AND M15 bearish BOS or FVG.
+
+        Returns True (enter allowed) if confluence conditions are met.
+        For paper backtest, reads precomputed columns from df row.
+        For live, uses self._mtf_live_cache.
+        """
+        if not self._is_scalp:
+            return True     # swing style — no MTF filter
+
+        bullish = action > 0
+
+        # --- Live mode: use cached fetched bars ---
+        if self._mtf_live_cache is not None:
+            m30_feat, m15_feat = self._mtf_live_cache
+            m30_bull = m30_feat['ema_cross'] > 0
+            m15_setup = m15_feat['bos'] > 0 or m15_feat['fvg'] > 0
+            if bullish:
+                ok = m30_bull and m15_setup
+            else:
+                m30_bear  = m30_feat['ema_cross'] < 0
+                m15_setup_bear = m15_feat['bos'] < 0 or m15_feat['fvg'] < 0
+                ok = m30_bear and m15_setup_bear
+            return ok
+
+        # --- Paper mode: read precomputed MTF columns from df slice ---
+        row = df.iloc[-1]
+        has_mtf = hasattr(row, 'get') and 'm30_ema_cross' in (
+            row.index if hasattr(row, 'index') else {}
+        )
+        if not has_mtf:
+            return True     # MTF columns not in df — pass through (first bars / legacy)
+
+        m30_cross = float(row.get('m30_ema_cross', 0.0))
+        m15_bos   = float(row.get('m15_bos', 0.0))
+        m15_fvg   = float(row.get('m15_fvg', 0.0))
+
+        if bullish:
+            return m30_cross > 0 and (m15_bos > 0 or m15_fvg > 0)
+        else:
+            return m30_cross < 0 and (m15_bos < 0 or m15_fvg < 0)
 
     # ── Position sizing ──────────────────────────────────────────────────────
 
@@ -256,7 +488,7 @@ class MT5EnsembleTrader:
         balance_usd = account.balance / 100.0 if account.currency == 'USC' else account.balance
 
         risk_pct = self.risk_pct
-        if self.style == 'scalp':
+        if self._is_scalp:
             base_risk = min(self.risk_pct, 0.01)
             scale     = self.SCALP_RISK_SCALE[min(pos_count, 2)]
             risk_pct  = base_risk * scale
@@ -286,12 +518,6 @@ class MT5EnsembleTrader:
         if len(df) < min_bars:
             return
 
-        # Skip new entries during high-impact news windows (live mode only)
-        blocked, reason = self.news_filter.is_news_window()
-        if blocked:
-            logger.info(f"[NEWS] Skipping bar — {reason}")
-            return
-
         self._update_regime(df)
 
         tick = self.connector.get_tick(self.symbol)
@@ -318,7 +544,7 @@ class MT5EnsembleTrader:
         )
 
         # Scalp: manage partial TP exits before checking for new entries
-        if self.style == 'scalp' and positions:
+        if self._is_scalp and positions:
             self._manage_scalp_tps(positions, current_price)
             all_positions = self.connector.get_positions(self.symbol)
             positions     = self._own_positions(all_positions)
@@ -331,8 +557,25 @@ class MT5EnsembleTrader:
             positions     = self._own_positions(all_positions)
             n_pos         = len(positions)
 
+        # Session gate: block new entries outside active windows (position management above is unaffected)
+        session_ok, session_reason = self.session_filter.is_allowed()
+        if not session_ok:
+            logger.debug(f"[SESSION] No new entries — {session_reason}")
+            return
+
+        # News gate: block new entries during high-impact releases
+        news_blocked, news_reason = self.news_filter.is_news_window()
+        if news_blocked:
+            logger.info(f"[NEWS] No new entries — {news_reason}")
+            return
+
+        # MTF confluence gate: M30 trend must align with M15 BOS/FVG before entry
+        if not self._mtf_confluence_ok(action, df):
+            logger.debug(f"[MTF] No confluence — skip entry (action={action:+.3f})")
+            return
+
         # Entry: scalp allows up to 3 with increasing confluence, swing stays 1
-        max_pos = self.MAX_SCALP_POSITIONS if self.style == 'scalp' else 1
+        max_pos = self.MAX_SCALP_POSITIONS if self._is_scalp else 1
         if n_pos < max_pos:
             self._try_entry(action, confidence, current_price, n_pos, positions)
 
@@ -341,11 +584,11 @@ class MT5EnsembleTrader:
         existing = existing or []
 
         # For 2nd and 3rd scalp trades require higher confidence
-        if self.style == 'scalp' and pos_count > 0:
+        if self._is_scalp and pos_count > 0:
             required = self.SCALP_CONF_THRESHOLDS[min(pos_count, 2)]
             if confidence < required:
                 logger.debug(
-                    f"[SCALP] Skip entry #{pos_count+1}: "
+                    f"[{self.style.upper()}] Skip entry #{pos_count+1}: "
                     f"conf={confidence:.3f} < {required:.2f} required"
                 )
                 return
@@ -358,15 +601,14 @@ class MT5EnsembleTrader:
             if action < -self.min_signal and existing_type != MT5Connector.ORDER_SELL:
                 return
 
-        tag = f"#{pos_count+1}" if self.style == 'scalp' else ""
+        tag = f"#{pos_count+1}" if self._is_scalp else ""
 
         if action > self.min_signal:
             volume = self._calc_volume(price, pos_count)
             sl_dist = price * self.stop_loss_pct
             sl = round(price - sl_dist, 2)
-            if self.style == 'scalp':
-                # Set MT5 TP at final RR level (TP3 = RR:2) as a safety net
-                # TP1 and TP2 are managed via software partial closes
+            if self._is_scalp:
+                # MT5 TP set at TP3 (RR:2) as safety net; TP1/TP2 managed via partial closes
                 rr_targets = self.cfg['rr_targets']
                 tp = round(price + sl_dist * rr_targets[-1], 2)
             else:
@@ -375,14 +617,14 @@ class MT5EnsembleTrader:
                 self.symbol, MT5Connector.ORDER_BUY, volume,
                 sl=sl, tp=tp, comment=f'{self.style}_buy{tag}'
             )
-            if result.success and self.style == 'scalp':
+            if result.success and self._is_scalp:
                 self._register_scalp_tps(result.ticket, price, volume, direction=1)
 
         elif action < -self.min_signal:
             volume = self._calc_volume(price, pos_count)
             sl_dist = price * self.stop_loss_pct
             sl = round(price + sl_dist, 2)
-            if self.style == 'scalp':
+            if self._is_scalp:
                 rr_targets = self.cfg['rr_targets']
                 tp = round(price - sl_dist * rr_targets[-1], 2)
             else:
@@ -391,7 +633,7 @@ class MT5EnsembleTrader:
                 self.symbol, MT5Connector.ORDER_SELL, volume,
                 sl=sl, tp=tp, comment=f'{self.style}_sell{tag}'
             )
-            if result.success and self.style == 'scalp':
+            if result.success and self._is_scalp:
                 self._register_scalp_tps(result.ticket, price, volume, direction=-1)
 
     def _manage_positions(self, positions: list, action: float):
@@ -489,6 +731,13 @@ class MT5EnsembleTrader:
         logger.info("=" * 55)
 
         df = self.connector.load_csv(csv)
+
+        # Add scalp indicators and precompute MTF columns for paper backtest
+        if self._is_scalp:
+            df = _add_scalp_indicators(df)
+            logger.info("Adding MTF features (M15, M30) for paper backtest ...")
+            df = _add_scalp_mtf_to_df(df)
+
         n  = len(df)
         start = int(n * split)
 
@@ -568,18 +817,27 @@ class MT5EnsembleTrader:
 
     def run_live(self):
         interval  = self.cfg['live_interval']
-        tf_label  = self.cfg['mt5_timeframe']
+        timeframe = self.cfg['mt5_timeframe']
         bar_count = self.cfg['mt5_bars']
 
         logger.info(f"[{self.style.upper()}] Live trading started | "
-                    f"Timeframe={tf_label} | Poll every {interval}s | Ctrl+C to stop")
+                    f"Timeframe={timeframe} | Poll every {interval}s | Ctrl+C to stop")
         try:
             while True:
-                df = self.connector.get_rates(self.symbol, count=bar_count)
+                df = self.connector.get_rates(self.symbol, count=bar_count,
+                                              timeframe=timeframe)
                 if df is not None and len(df) >= self.cfg['min_bars']:
-                    # Add scalp indicators if needed (swing indicators added in get_rates)
-                    if self.style == 'scalp':
+                    if self._is_scalp:
                         df = _add_scalp_indicators(df)
+                        # Fetch HTF bars for MTF confluence gate + hf_scalp obs
+                        m30_raw = self.connector.get_rates(self.symbol, count=60,
+                                                           timeframe='M30')
+                        m15_raw = self.connector.get_rates(self.symbol, count=60,
+                                                           timeframe='M15')
+                        self._mtf_live_cache = (
+                            _compute_htf_features(m30_raw),
+                            _compute_htf_features(m15_raw),
+                        )
                     self.on_bar(df)
                 else:
                     logger.warning("Insufficient bars — skipping")
@@ -627,7 +885,7 @@ def main():
         formatter_class=argparse.RawTextHelpFormatter,
     )
     parser.add_argument('--mode',  choices=['paper', 'live'], default='paper')
-    parser.add_argument('--style', choices=['swing', 'scalp'], default='swing')
+    parser.add_argument('--style', choices=['swing', 'scalp', 'hf_scalp'], default='swing')
     parser.add_argument('--csv',      default=None, help='Override CSV data file')
     parser.add_argument('--split',    type=float, default=0.8)
     parser.add_argument('--ensemble', default=None, help='Override models directory')
