@@ -23,6 +23,7 @@ class AccountInfo:
     margin: float
     free_margin: float
     profit: float
+    currency: str = 'USD'
 
 
 @dataclass
@@ -203,7 +204,7 @@ class MT5Connector:
         info = self._mt5.account_info()
         return AccountInfo(balance=info.balance, equity=info.equity,
                            margin=info.margin, free_margin=info.margin_free,
-                           profit=info.profit)
+                           profit=info.profit, currency=info.currency)
 
     # ── Orders ───────────────────────────────────────────────────────────────
 

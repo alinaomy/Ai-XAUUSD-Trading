@@ -44,6 +44,7 @@ load_dotenv()
 from mt5_connector import MT5Connector, add_indicators
 from ensemble_trader import EnsembleTrader
 from market_regime_detector import MarketRegimeDetector
+from news_filter import NewsFilter
 
 logging.basicConfig(
     level=logging.INFO,
@@ -181,6 +182,13 @@ class MT5EnsembleTrader:
         self.min_signal       = self.cfg['min_signal']
         self.trailing_stop_pct = self.stop_loss_pct  # updated by regime for swing
 
+        # News filter: skip entries during high-impact events (scalp only by default)
+        self.news_filter = NewsFilter(
+            pause_minutes_before=15,
+            pause_minutes_after=30,
+            enabled=(style == 'scalp'),   # swing holds through news; scalp doesn't
+        )
+
     # ── Observation ──────────────────────────────────────────────────────────
 
     def _build_obs(self, df: pd.DataFrame) -> np.ndarray:
@@ -208,18 +216,22 @@ class MT5EnsembleTrader:
 
     def _calc_volume(self, price: float, pos_count: int = 0) -> float:
         account = self.connector.get_account_info()
+
+        # Cent accounts (USC) store balance in cents — convert to USD for sizing
+        balance_usd = account.balance / 100.0 if account.currency == 'USC' else account.balance
+
         risk_pct = self.risk_pct
         if self.style == 'scalp':
-            # Cap base risk at 1% for scalp, then scale down per additional position
             base_risk = min(self.risk_pct, 0.01)
             scale     = self.SCALP_RISK_SCALE[min(pos_count, 2)]
             risk_pct  = base_risk * scale
-        risk_amount   = account.balance * risk_pct
+
+        risk_amount   = balance_usd * risk_pct
         risk_in_price = price * self.stop_loss_pct
         volume = risk_amount / (risk_in_price * 100)
         logger.debug(
-            f"[SIZING] pos#{pos_count+1} risk={risk_pct*100:.2f}% "
-            f"→ ${risk_amount:.2f} risk → {volume:.2f} lots"
+            f"[SIZING] pos#{pos_count+1} balance=${balance_usd:.2f}({account.currency}) "
+            f"risk={risk_pct*100:.2f}% → ${risk_amount:.2f} → {volume:.4f} lots"
         )
         return round(max(0.01, min(volume, 10.0)), 2)
 
@@ -237,6 +249,12 @@ class MT5EnsembleTrader:
     def on_bar(self, df: pd.DataFrame):
         min_bars = self.cfg['min_bars']
         if len(df) < min_bars:
+            return
+
+        # Skip new entries during high-impact news windows (live mode only)
+        blocked, reason = self.news_filter.is_news_window()
+        if blocked:
+            logger.info(f"[NEWS] Skipping bar — {reason}")
             return
 
         self._update_regime(df)

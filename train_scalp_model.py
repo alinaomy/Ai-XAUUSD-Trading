@@ -19,9 +19,10 @@ import time
 
 import numpy as np
 import pandas as pd
+import torch
 from stable_baselines3 import PPO, SAC, TD3
-from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
-from stable_baselines3.common.callbacks import BaseCallback, EvalCallback
+from stable_baselines3.common.vec_env import DummyVecEnv
+from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.monitor import Monitor
 
 from trading_env_scalp import ScalpTradingEnv
@@ -30,36 +31,48 @@ SAVE_PATH = './scalp_models/'
 DATA_FILE = 'xauusd_m5_data.csv'
 
 # Hyperparameters tuned for M5 scalping
+# Use Apple MPS (Metal) if available, otherwise CPU
+_DEVICE = 'mps' if torch.backends.mps.is_available() else 'cpu'
+
+# Each model gets its OWN dict — SB3 mutates policy_kwargs in-place (adds use_sde)
+# so sharing one dict across models causes TD3 to receive use_sde=True and crash.
+
 PPO_PARAMS = dict(
-    learning_rate=1e-4,
-    n_steps=2048,
-    batch_size=256,
+    learning_rate=3e-4,
+    n_steps=4096,
+    batch_size=512,
     n_epochs=10,
     gamma=0.95,
     gae_lambda=0.95,
     clip_range=0.2,
-    ent_coef=0.01,
+    ent_coef=0.02,
+    policy_kwargs={'net_arch': [256, 256, 128]},
+    device=_DEVICE,
     verbose=1,
 )
 
 SAC_PARAMS = dict(
     learning_rate=3e-4,
-    buffer_size=500_000,
-    learning_starts=5_000,
-    batch_size=256,
+    buffer_size=1_000_000,
+    learning_starts=10_000,
+    batch_size=512,
     gamma=0.95,
     tau=0.005,
     ent_coef='auto',
+    policy_kwargs={'net_arch': [256, 256, 128]},
+    device=_DEVICE,
     verbose=1,
 )
 
 TD3_PARAMS = dict(
     learning_rate=3e-4,
-    buffer_size=500_000,
-    learning_starts=5_000,
-    batch_size=256,
+    buffer_size=1_000_000,
+    learning_starts=10_000,
+    batch_size=512,
     gamma=0.95,
     tau=0.005,
+    policy_kwargs={'net_arch': [256, 256, 128]},
+    device=_DEVICE,
     verbose=1,
 )
 

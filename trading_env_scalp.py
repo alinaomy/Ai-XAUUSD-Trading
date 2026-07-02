@@ -127,6 +127,19 @@ class ScalpTradingEnv(gym.Env):
 
         return np.concatenate([prices.astype(np.float32), indicators])
 
+    # ATR spike threshold: if current ATR > this multiple of rolling mean → news bar
+    NEWS_ATR_MULTIPLIER = 2.5
+
+    def _is_news_bar(self) -> bool:
+        """Detect high-impact news bars using ATR spike detection."""
+        i = self.current_step
+        atr_now = self.df['atr14'].iloc[i]
+        # Rolling mean of ATR over past 50 bars (excluding current)
+        atr_mean = self.df['atr14'].iloc[max(0, i - 50):i].mean()
+        if atr_mean == 0:
+            return False
+        return (atr_now / atr_mean) > self.NEWS_ATR_MULTIPLIER
+
     # ── Step ─────────────────────────────────────────────────────────────────
 
     def step(self, action):
@@ -135,17 +148,20 @@ class ScalpTradingEnv(gym.Env):
 
         current_price = float(self.df.iloc[self.current_step]['Close'])
         reward = 0.0
+        news_bar = self._is_news_bar()
 
-        # 1 — Check exits first
+        # 1 — Check exits first (always exit even during news)
         exit_reason = self._check_exits(current_price)
         if exit_reason:
             reward = self._close_position(current_price, exit_reason)
 
-        # 2 — Entry if flat
+        # 2 — Entry if flat AND not a news bar
         elif self.position == 0:
-            if action > 0.15:        # Long signal
+            if news_bar:
+                reward = -0.0005   # small penalty for wanting to trade during news
+            elif action > 0.15:
                 reward = self._open_position(action, current_price, direction=1)
-            elif action < -0.15:     # Short signal
+            elif action < -0.15:
                 reward = self._open_position(action, current_price, direction=-1)
 
         # 3 — Manage open position
