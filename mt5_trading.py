@@ -541,8 +541,8 @@ class MT5EnsembleTrader:
     def _m5_range_entry_ok(self, action: float, df: pd.DataFrame) -> bool:
         """Ranging regime: mean-reversion entry at range boundaries with RSI confirmation.
 
-        Long  — price in bottom 25% of 20-bar range AND RSI7 < 38 (oversold)
-        Short — price in top    25% of 20-bar range AND RSI7 > 62 (overbought)
+        Long  — price in bottom 30% of 20-bar range AND RSI7 < 45 (below neutral)
+        Short — price in top    30% of 20-bar range AND RSI7 > 55 (above neutral)
         """
         if len(df) < 22:
             return False
@@ -558,9 +558,9 @@ class MT5EnsembleTrader:
         adx      = float(df['adx'].iloc[-1])  if 'adx'  in df.columns else 0.0
 
         if action > 0:
-            ok = pos < 0.25 and rsi < 38
+            ok = pos < 0.30 and rsi < 45
         else:
-            ok = pos > 0.75 and rsi > 62
+            ok = pos > 0.70 and rsi > 55
         logger.info(
             f"[M5-RANGE] {'LONG' if action > 0 else 'SHORT'} "
             f"ADX={adx:.1f} pos_in_range={pos:.2f} RSI={rsi:.1f} -> {'OK' if ok else 'SKIP'}"
