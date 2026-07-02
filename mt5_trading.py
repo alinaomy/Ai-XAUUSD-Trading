@@ -427,6 +427,31 @@ class MT5EnsembleTrader:
         except Exception as exc:
             logger.debug(f"Regime skipped: {exc}")
 
+    # ── Dynamic SL based on ATR ──────────────────────────────────────────────
+
+    # SL = ATR14 * multiplier, clamped to [SL_MIN_PCT, SL_MAX_PCT] of price
+    ATR_SL_MULTIPLIER = 1.5
+    SL_MIN_PCT        = 0.0010   # 0.10% floor  — never closer than this
+    SL_MAX_PCT        = 0.0035   # 0.35% ceiling — don't widen infinitely
+
+    def _dynamic_sl_dist(self, df: pd.DataFrame, price: float) -> float:
+        """Return SL distance in price units, scaled to current ATR.
+
+        Falls back to config stop_loss_pct if ATR not available.
+        """
+        if not self._is_scalp or 'atr14' not in df.columns:
+            return price * self.stop_loss_pct
+
+        atr = float(df['atr14'].iloc[-1])
+        if atr <= 0:
+            return price * self.stop_loss_pct
+
+        sl_dist = atr * self.ATR_SL_MULTIPLIER
+        # Clamp between min and max percentage of current price
+        sl_dist = max(sl_dist, price * self.SL_MIN_PCT)
+        sl_dist = min(sl_dist, price * self.SL_MAX_PCT)
+        return sl_dist
+
     # ── ATR spike / news bar detection ──────────────────────────────────────
 
     # Mirrors ScalpTradingEnv._is_news_bar() — consistent between train and live
@@ -519,7 +544,8 @@ class MT5EnsembleTrader:
     # Scalp risk scales down with each additional position to cap total exposure
     SCALP_RISK_SCALE = [1.0, 0.75, 0.5]   # 1st=100%, 2nd=75%, 3rd=50% of risk_pct
 
-    def _calc_volume(self, price: float, pos_count: int = 0) -> float:
+    def _calc_volume(self, price: float, pos_count: int = 0,
+                     sl_dist: float = None) -> float:
         account = self.connector.get_account_info()
 
         # Cent accounts (USC) store balance in cents — convert to USD for sizing
@@ -532,11 +558,13 @@ class MT5EnsembleTrader:
             risk_pct  = base_risk * scale
 
         risk_amount   = balance_usd * risk_pct
-        risk_in_price = price * self.stop_loss_pct
+        # Use actual SL distance if provided (dynamic ATR-based), else fall back to fixed %
+        risk_in_price = sl_dist if sl_dist else price * self.stop_loss_pct
         volume = risk_amount / (risk_in_price * 100)
         logger.debug(
             f"[SIZING] pos#{pos_count+1} balance=${balance_usd:.2f}({account.currency}) "
-            f"risk={risk_pct*100:.2f}% → ${risk_amount:.2f} → {volume:.4f} lots"
+            f"risk={risk_pct*100:.2f}% sl_dist={risk_in_price:.2f} "
+            f"→ ${risk_amount:.2f} → {volume:.4f} lots"
         )
         return round(max(0.01, min(volume, 10.0)), 2)
 
@@ -621,10 +649,11 @@ class MT5EnsembleTrader:
         # Entry: scalp allows up to 3 with increasing confluence, swing stays 1
         max_pos = self.MAX_SCALP_POSITIONS if self._is_scalp else 1
         if n_pos < max_pos:
-            self._try_entry(action, confidence, current_price, n_pos, positions)
+            self._try_entry(action, confidence, current_price, n_pos, positions, df=df)
 
     def _try_entry(self, action: float, confidence: float, price: float,
-                   pos_count: int = 0, existing: list = None):
+                   pos_count: int = 0, existing: list = None,
+                   df: pd.DataFrame = None):
         existing = existing or []
 
         # For 2nd and 3rd scalp trades require higher confidence
@@ -647,12 +676,18 @@ class MT5EnsembleTrader:
 
         tag = f"#{pos_count+1}" if self._is_scalp else ""
 
+        # Compute SL distance once — ATR-dynamic for scalp, fixed % for swing
+        sl_dist = self._dynamic_sl_dist(df, price) if df is not None else price * self.stop_loss_pct
+        sl_pct  = sl_dist / price
+        logger.debug(
+            f"[{self.style.upper()}] SL dist={sl_dist:.2f} ({sl_pct*100:.3f}%) "
+            f"ATR-based={df is not None and 'atr14' in df.columns}"
+        )
+
         if action > self.min_signal:
-            volume = self._calc_volume(price, pos_count)
-            sl_dist = price * self.stop_loss_pct
+            volume = self._calc_volume(price, pos_count, sl_dist=sl_dist)
             sl = round(price - sl_dist, 2)
             if self._is_scalp:
-                # MT5 TP set at TP3 (RR:2) as safety net; TP1/TP2 managed via partial closes
                 rr_targets = self.cfg['rr_targets']
                 tp = round(price + sl_dist * rr_targets[-1], 2)
             else:
@@ -662,11 +697,11 @@ class MT5EnsembleTrader:
                 sl=sl, tp=tp, comment=f'{self.style}_buy{tag}'
             )
             if result.success and self._is_scalp:
-                self._register_scalp_tps(result.ticket, price, volume, direction=1)
+                self._register_scalp_tps(result.ticket, price, volume,
+                                         direction=1, sl_dist=sl_dist)
 
         elif action < -self.min_signal:
-            volume = self._calc_volume(price, pos_count)
-            sl_dist = price * self.stop_loss_pct
+            volume = self._calc_volume(price, pos_count, sl_dist=sl_dist)
             sl = round(price + sl_dist, 2)
             if self._is_scalp:
                 rr_targets = self.cfg['rr_targets']
@@ -678,7 +713,8 @@ class MT5EnsembleTrader:
                 sl=sl, tp=tp, comment=f'{self.style}_sell{tag}'
             )
             if result.success and self._is_scalp:
-                self._register_scalp_tps(result.ticket, price, volume, direction=-1)
+                self._register_scalp_tps(result.ticket, price, volume,
+                                         direction=-1, sl_dist=sl_dist)
 
     def _manage_positions(self, positions: list, action: float):
         """Close any position whose direction conflicts with current signal."""
@@ -692,9 +728,10 @@ class MT5EnsembleTrader:
     def _manage_position(self, pos, action: float):
         self._manage_positions([pos], action)
 
-    def _register_scalp_tps(self, ticket: int, entry: float, volume: float, direction: int):
+    def _register_scalp_tps(self, ticket: int, entry: float, volume: float,
+                            direction: int, sl_dist: float = None):
         """Store TP price levels for a newly opened scalp position."""
-        sl_dist   = entry * self.stop_loss_pct
+        sl_dist    = sl_dist or (entry * self.stop_loss_pct)
         rr_targets = self.cfg['rr_targets']
         fractions  = self.cfg['tp_fractions']
         if direction == 1:
