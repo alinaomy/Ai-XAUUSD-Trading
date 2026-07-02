@@ -534,7 +534,7 @@ class MT5EnsembleTrader:
         logger.debug(
             f"[M5-BREAKOUT] {'LONG' if action > 0 else 'SHORT'} "
             f"close={close:.2f} vs {'high' if action > 0 else 'low'}10="
-            f"{high_10 if action > 0 else low_10:.2f} → {'OK' if ok else 'SKIP'}"
+            f"{high_10 if action > 0 else low_10:.2f} -> {'OK' if ok else 'SKIP'}"
         )
         return ok
 
@@ -563,7 +563,7 @@ class MT5EnsembleTrader:
             ok = pos > 0.75 and rsi > 62
         logger.info(
             f"[M5-RANGE] {'LONG' if action > 0 else 'SHORT'} "
-            f"ADX={adx:.1f} pos_in_range={pos:.2f} RSI={rsi:.1f} → {'OK' if ok else 'SKIP'}"
+            f"ADX={adx:.1f} pos_in_range={pos:.2f} RSI={rsi:.1f} -> {'OK' if ok else 'SKIP'}"
         )
         return ok
 
@@ -641,7 +641,7 @@ class MT5EnsembleTrader:
         logger.debug(
             f"[SIZING] pos#{pos_count+1} balance=${balance_usd:.2f}({account.currency}) "
             f"risk={risk_pct*100:.2f}% sl_dist={risk_in_price:.2f} "
-            f"→ ${risk_amount:.2f} → {volume:.4f} lots"
+            f"-> ${risk_amount:.2f} -> {volume:.4f} lots"
         )
         return round(max(0.01, min(volume, 10.0)), 2)
 
@@ -922,7 +922,7 @@ class MT5EnsembleTrader:
         start = int(n * split)
 
         logger.info(f"Total bars: {n:,} | Test: {n-start:,}")
-        logger.info(f"Test window: {df.index[start]} → {df.index[-1]}")
+        logger.info(f"Test window: {df.index[start]} -> {df.index[-1]}")
 
         self.connector.set_paper_data(df)
         self.connector._paper_idx = start
