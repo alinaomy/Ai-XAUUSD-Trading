@@ -79,7 +79,9 @@ STYLE_CONFIG = {
         'min_bars':      30,
         'lookback':      20,
         'stop_loss_pct': 0.0015,
-        'tp_multiplier': 3.0,
+        # 3 partial TPs at RR 0.5, 1.0, 2.0  (TP3 = 2.0 set as MT5 TP for safety)
+        'rr_targets':    [0.5, 1.0, 2.0],
+        'tp_fractions':  [1/3, 1/3, 1/3],
         'min_signal':    0.15,
         'mt5_timeframe': 'M5',
         'live_interval': 300,      # poll every 5 minutes (M5 bar)
@@ -90,8 +92,16 @@ STYLE_CONFIG = {
 
 # ── Scalp observation builder ─────────────────────────────────────────────────
 
-def _build_scalp_obs(df: pd.DataFrame) -> np.ndarray:
-    """28-feature observation matching ScalpTradingEnv."""
+def _build_scalp_obs(
+    df: pd.DataFrame,
+    signed_remaining: float = 0.0,
+    tp_progress: float = 0.0,
+) -> np.ndarray:
+    """28-feature observation matching ScalpTradingEnv.
+
+    signed_remaining: +1.0=full long, -1.0=full short, ±0.67/±0.33 after partial TPs, 0=flat
+    tp_progress:      0.0 → 0.33 → 0.67 → 1.0 as each TP level is hit
+    """
     lookback = 20
     close = float(df['Close'].iloc[-1])
     prices = (df['Close'].iloc[-lookback:].values.astype(float) / close) - 1.0
@@ -106,8 +116,8 @@ def _build_scalp_obs(df: pd.DataFrame) -> np.ndarray:
         float(row.get('macd',     0.0))  / (close + 1e-9),
         float(row.get('macd_sig', 0.0))  / (close + 1e-9),
         float(row.get('stoch_k',  50.0)) / 100.0,
-        0.0,   # position placeholder
-        0.0,   # time-in-trade placeholder
+        float(signed_remaining),   # direction + remaining fraction (matches env)
+        float(tp_progress),        # TP cascade progress (matches env)
     ], dtype=np.float32)
     return np.concatenate([prices.astype(np.float32), indicators]).reshape(1, -1)
 
@@ -178,9 +188,15 @@ class MT5EnsembleTrader:
 
         self.regime_detector  = MarketRegimeDetector()
         self.stop_loss_pct    = self.cfg['stop_loss_pct']
-        self.tp_multiplier    = self.cfg['tp_multiplier']
         self.min_signal       = self.cfg['min_signal']
         self.trailing_stop_pct = self.stop_loss_pct  # updated by regime for swing
+
+        # Swing still uses a single TP multiplier; scalp uses RR-based partials
+        self.tp_multiplier = self.cfg.get('tp_multiplier', 4.0)
+
+        # Per-ticket TP tracking for scalp partial exits
+        # ticket → {tp_prices, tp_hit, initial_vol, direction}
+        self._scalp_tp_info: dict = {}
 
         # News filter: skip entries during high-impact events (scalp only by default)
         self.news_filter = NewsFilter(
@@ -191,10 +207,29 @@ class MT5EnsembleTrader:
 
     # ── Observation ──────────────────────────────────────────────────────────
 
-    def _build_obs(self, df: pd.DataFrame) -> np.ndarray:
+    def _build_obs(self, df: pd.DataFrame, positions: list = None) -> np.ndarray:
         if self.style == 'scalp':
-            return _build_scalp_obs(df)
+            signed_remaining, tp_progress = self._scalp_obs_state(positions or [])
+            return _build_scalp_obs(df, signed_remaining, tp_progress)
         return _build_swing_obs(df)
+
+    def _scalp_obs_state(self, positions: list) -> tuple:
+        """Compute signed_remaining and tp_progress from live position state."""
+        if not positions:
+            return 0.0, 0.0
+
+        pos = positions[0]
+        direction = 1 if pos.type == MT5Connector.ORDER_BUY else -1
+
+        info = self._scalp_tp_info.get(pos.ticket)
+        if info is None:
+            return float(direction), 0.0
+
+        tps_hit = sum(info['tp_hit'])
+        remaining_frac = 1.0 - tps_hit * (1/3)
+        signed_remaining = remaining_frac * direction
+        tp_progress = tps_hit / 3.0
+        return signed_remaining, tp_progress
 
     # ── Regime (swing only) ──────────────────────────────────────────────────
 
@@ -259,11 +294,6 @@ class MT5EnsembleTrader:
 
         self._update_regime(df)
 
-        obs = self._build_obs(df)
-        action, confidence = self.ensemble.predict_ensemble(obs)
-        action     = float(np.squeeze(action))
-        confidence = float(np.squeeze(confidence))
-
         tick = self.connector.get_tick(self.symbol)
         if tick is None:
             logger.warning("No tick — skipping bar")
@@ -272,10 +302,14 @@ class MT5EnsembleTrader:
         current_price = tick.ask
 
         # Only count/manage positions this bot opened (identified by comment prefix)
-        # This prevents interfering with manual trades or other strategies
         all_positions = self.connector.get_positions(self.symbol)
         positions     = self._own_positions(all_positions)
         n_pos         = len(positions)
+
+        obs = self._build_obs(df, positions)
+        action, confidence = self.ensemble.predict_ensemble(obs)
+        action     = float(np.squeeze(action))
+        confidence = float(np.squeeze(confidence))
 
         logger.info(
             f"[{self.style.upper()}] {self.connector.current_bar_date} | "
@@ -283,7 +317,14 @@ class MT5EnsembleTrader:
             f"pos={n_pos} (total_mt5={len(all_positions)})"
         )
 
-        # Manage only bot-owned positions — close any that get a signal flip
+        # Scalp: manage partial TP exits before checking for new entries
+        if self.style == 'scalp' and positions:
+            self._manage_scalp_tps(positions, current_price)
+            all_positions = self.connector.get_positions(self.symbol)
+            positions     = self._own_positions(all_positions)
+            n_pos         = len(positions)
+
+        # Manage signal flips (close opposing direction positions)
         if positions:
             self._manage_positions(positions, action)
             all_positions = self.connector.get_positions(self.symbol)
@@ -321,20 +362,37 @@ class MT5EnsembleTrader:
 
         if action > self.min_signal:
             volume = self._calc_volume(price, pos_count)
-            sl = round(price * (1 - self.stop_loss_pct), 2)
-            tp = round(price * (1 + self.stop_loss_pct * self.tp_multiplier), 2)
-            self.connector.place_order(
+            sl_dist = price * self.stop_loss_pct
+            sl = round(price - sl_dist, 2)
+            if self.style == 'scalp':
+                # Set MT5 TP at final RR level (TP3 = RR:2) as a safety net
+                # TP1 and TP2 are managed via software partial closes
+                rr_targets = self.cfg['rr_targets']
+                tp = round(price + sl_dist * rr_targets[-1], 2)
+            else:
+                tp = round(price + sl_dist * self.tp_multiplier, 2)
+            result = self.connector.place_order(
                 self.symbol, MT5Connector.ORDER_BUY, volume,
                 sl=sl, tp=tp, comment=f'{self.style}_buy{tag}'
             )
+            if result.success and self.style == 'scalp':
+                self._register_scalp_tps(result.ticket, price, volume, direction=1)
+
         elif action < -self.min_signal:
             volume = self._calc_volume(price, pos_count)
-            sl = round(price * (1 + self.stop_loss_pct), 2)
-            tp = round(price * (1 - self.stop_loss_pct * self.tp_multiplier), 2)
-            self.connector.place_order(
+            sl_dist = price * self.stop_loss_pct
+            sl = round(price + sl_dist, 2)
+            if self.style == 'scalp':
+                rr_targets = self.cfg['rr_targets']
+                tp = round(price - sl_dist * rr_targets[-1], 2)
+            else:
+                tp = round(price - sl_dist * self.tp_multiplier, 2)
+            result = self.connector.place_order(
                 self.symbol, MT5Connector.ORDER_SELL, volume,
                 sl=sl, tp=tp, comment=f'{self.style}_sell{tag}'
             )
+            if result.success and self.style == 'scalp':
+                self._register_scalp_tps(result.ticket, price, volume, direction=-1)
 
     def _manage_positions(self, positions: list, action: float):
         """Close any position whose direction conflicts with current signal."""
@@ -347,6 +405,79 @@ class MT5EnsembleTrader:
 
     def _manage_position(self, pos, action: float):
         self._manage_positions([pos], action)
+
+    def _register_scalp_tps(self, ticket: int, entry: float, volume: float, direction: int):
+        """Store TP price levels for a newly opened scalp position."""
+        sl_dist   = entry * self.stop_loss_pct
+        rr_targets = self.cfg['rr_targets']
+        fractions  = self.cfg['tp_fractions']
+        if direction == 1:
+            tp_prices = [round(entry + sl_dist * rr, 2) for rr in rr_targets]
+        else:
+            tp_prices = [round(entry - sl_dist * rr, 2) for rr in rr_targets]
+        self._scalp_tp_info[ticket] = {
+            'tp_prices':   tp_prices,
+            'tp_hit':      [False, False, False],
+            'initial_vol': volume,
+            'fractions':   fractions,
+            'direction':   direction,
+            'entry':       entry,
+        }
+        logger.info(
+            f"[SCALP] Registered TPs ticket#{ticket} | "
+            f"TP1={tp_prices[0]:.2f} TP2={tp_prices[1]:.2f} TP3={tp_prices[2]:.2f}"
+        )
+
+    def _manage_scalp_tps(self, positions: list, current_price: float):
+        """Check and execute partial TP exits for open scalp positions."""
+        for pos in positions:
+            ticket = pos.ticket
+            info   = self._scalp_tp_info.get(ticket)
+            if info is None:
+                continue
+
+            direction = info['direction']
+            tp_prices = info['tp_prices']
+            fractions = info['fractions']
+
+            for i, (tp_price, fraction) in enumerate(zip(tp_prices, fractions)):
+                if info['tp_hit'][i]:
+                    continue
+
+                tp_reached = (direction == 1 and current_price >= tp_price) or \
+                             (direction == -1 and current_price <= tp_price)
+                if not tp_reached:
+                    continue
+
+                info['tp_hit'][i] = True
+                close_vol = round(info['initial_vol'] * fraction, 2)
+                close_vol = max(close_vol, 0.01)
+
+                result = self.connector.partial_close_position(
+                    ticket, close_vol, comment=f'tp{i+1}'
+                )
+                if result.success:
+                    rr = self.cfg['rr_targets'][i]
+                    logger.info(
+                        f"[SCALP] TP{i+1} RR:{rr} hit @ {current_price:.2f} | "
+                        f"Closed {close_vol:.2f}lot ticket#{ticket}"
+                    )
+                    # TP1 hit → move SL to breakeven
+                    if i == 0:
+                        buf = info['entry'] * 0.0002
+                        be_sl = round(
+                            info['entry'] + buf if direction == 1
+                            else info['entry'] - buf,
+                            2
+                        )
+                        self.connector.modify_sl(ticket, be_sl)
+                        logger.info(f"[SCALP] SL moved to breakeven {be_sl:.2f} ticket#{ticket}")
+
+        # Clean up info for fully-closed tickets
+        open_tickets = {p.ticket for p in positions}
+        stale = [t for t in self._scalp_tp_info if t not in open_tickets]
+        for t in stale:
+            del self._scalp_tp_info[t]
 
     # ── Paper backtest ───────────────────────────────────────────────────────
 

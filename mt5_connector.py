@@ -314,6 +314,90 @@ class MT5Connector:
         )
         return TradeResult(success=True, ticket=ticket)
 
+    def partial_close_position(self, ticket: int, volume: float, comment: str = '') -> TradeResult:
+        """Close a partial volume of an open position."""
+        if ticket not in self._positions:
+            return TradeResult(success=False, comment=f"Ticket {ticket} not found")
+
+        pos = self._positions[ticket]
+        volume = round(min(volume, pos.volume), 2)
+
+        if volume <= 0:
+            return TradeResult(success=False, comment="Volume must be > 0")
+        if volume >= pos.volume:
+            return self.close_position(ticket, comment)
+
+        if self.mode == 'paper':
+            tick = self.get_tick(pos.symbol)
+            close_price = tick.bid if pos.type == self.ORDER_BUY else tick.ask
+            pnl = ((close_price - pos.price_open) if pos.type == self.ORDER_BUY
+                   else (pos.price_open - close_price)) * volume
+            self._paper_balance += pnl
+            self._positions[ticket].volume = round(pos.volume - volume, 2)
+            self._paper_trades.append({
+                'ticket': ticket, 'symbol': pos.symbol,
+                'type': 'BUY' if pos.type == self.ORDER_BUY else 'SELL',
+                'volume': volume, 'price_open': pos.price_open,
+                'price_close': close_price, 'pnl': round(pnl, 2),
+                'comment': f'partial_{comment}', 'date_close': self.current_bar_date,
+            })
+            logger.info(
+                f"[PAPER] PARTIAL #{ticket} {volume:.2f}lot @ {close_price:.2f} | "
+                f"PnL=${pnl:+.2f} | remaining={self._positions[ticket].volume:.2f}"
+            )
+            return TradeResult(success=True, ticket=ticket)
+
+        tick = self._mt5.symbol_info_tick(pos.symbol)
+        close_type = self.ORDER_SELL if pos.type == self.ORDER_BUY else self.ORDER_BUY
+        price = tick.bid if pos.type == self.ORDER_BUY else tick.ask
+        request = {
+            'action': self._mt5.TRADE_ACTION_DEAL,
+            'symbol': pos.symbol,
+            'volume': float(volume),
+            'type': close_type,
+            'position': ticket,
+            'price': price,
+            'comment': f'partial_{comment}',
+            'type_time': self._mt5.ORDER_TIME_GTC,
+            'type_filling': self._mt5.ORDER_FILLING_IOC,
+        }
+        result = self._mt5.order_send(request)
+        if result.retcode == self._mt5.TRADE_RETCODE_DONE:
+            if ticket in self._positions:
+                self._positions[ticket].volume = round(pos.volume - volume, 2)
+                if self._positions[ticket].volume <= 0:
+                    del self._positions[ticket]
+            logger.info(f"[MT5] PARTIAL close #{ticket} {volume:.2f}lot @ {price:.2f}")
+            return TradeResult(success=True, ticket=ticket)
+        logger.error(f"[MT5] Partial close failed: {result.retcode} {result.comment}")
+        return TradeResult(success=False, comment=result.comment)
+
+    def modify_sl(self, ticket: int, sl: float) -> TradeResult:
+        """Modify the stop-loss of an open position (e.g. move to breakeven)."""
+        if ticket not in self._positions:
+            return TradeResult(success=False, comment=f"Ticket {ticket} not found")
+
+        if self.mode == 'paper':
+            self._positions[ticket].sl = sl
+            logger.info(f"[PAPER] Modified SL #{ticket} → {sl:.2f}")
+            return TradeResult(success=True, ticket=ticket)
+
+        pos = self._positions[ticket]
+        request = {
+            'action': self._mt5.TRADE_ACTION_SLTP,
+            'symbol': pos.symbol,
+            'position': ticket,
+            'sl': sl,
+            'tp': pos.tp,
+        }
+        result = self._mt5.order_send(request)
+        if result.retcode == self._mt5.TRADE_RETCODE_DONE:
+            self._positions[ticket].sl = sl
+            logger.info(f"[MT5] SL modified #{ticket} → {sl:.2f}")
+            return TradeResult(success=True, ticket=ticket)
+        logger.error(f"[MT5] Modify SL failed: {result.retcode} {result.comment}")
+        return TradeResult(success=False, comment=result.comment)
+
     def close_all_positions(self):
         for ticket in list(self._positions.keys()):
             self.close_position(ticket, comment='close_all')

@@ -163,16 +163,33 @@ def quick_eval(model, test_df: pd.DataFrame, name: str):
         done = terminated or truncated
 
     trades = pd.DataFrame(env.trades)
-    closed = trades[trades['action'] == 'close'] if not trades.empty else pd.DataFrame()
+    if trades.empty:
+        print(f"\n  {name.upper()} eval: no trades")
+        return
+
+    partials = trades[trades['action'] == 'partial_close']
+    full_cls = trades[trades['action'] == 'close']
+    all_cls  = trades[trades['action'].isin(['partial_close', 'close'])]
+
+    # TP breakdown
+    tp_counts = [0, 0, 0]
+    for _, r in partials.iterrows():
+        lvl = int(r.get('tp_level', 1))
+        if 1 <= lvl <= 3:
+            tp_counts[lvl - 1] += 1
+
+    wins = all_cls[all_cls['pnl'] > 0]
 
     print(f"\n  {name.upper()} eval on test set:")
     print(f"    Final balance : ${env.balance:.2f}")
     print(f"    Total profit  : ${env.total_profit:.2f}")
-    if not closed.empty:
-        wins = closed[closed['pnl'] > 0]
-        print(f"    Trades        : {len(closed)}")
-        print(f"    Win rate      : {len(wins)/len(closed)*100:.1f}%")
-        print(f"    Avg PnL       : ${closed['pnl'].mean():.4f}")
+    print(f"    Entries       : {len(trades[trades['action']=='open'])}")
+    print(f"    TP1 hits      : {tp_counts[0]}  (RR 0.5, close 1/3)")
+    print(f"    TP2 hits      : {tp_counts[1]}  (RR 1.0, close 1/3)")
+    print(f"    TP3 hits      : {tp_counts[2]}  (RR 2.0, close 1/3)")
+    if not all_cls.empty:
+        print(f"    Win rate      : {len(wins)/len(all_cls)*100:.1f}% (all close events)")
+        print(f"    Avg PnL/close : ${all_cls['pnl'].mean():.4f}")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
